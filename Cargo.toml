@@ -1,0 +1,25 @@
+[package]
+name = "pulsar-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Pulsar relay / rendezvous server — assigns device IDs, coordinates P2P hole punching, and relays traffic when direct connection fails."
+
+[lib]
+name = "pulsar_relay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pulsar-relay"
+path = "src/main.rs"
+
+[dependencies]
+pulsar-proto.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rand.workspace = true
+clap = { version = "4", features = ["derive", "env"] }
