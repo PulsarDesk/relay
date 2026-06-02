@@ -223,7 +223,8 @@ impl Relay {
 			ClientMsg::Bye { id, token } => {
 				if self.authed(id, token) {
 					self.devices.remove(&id);
-					self.sessions.retain(|_, s| s.requester != id && s.target != id);
+					self.sessions
+						.retain(|_, s| s.requester != id && s.target != id);
 				}
 				None
 			}

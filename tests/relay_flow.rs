@@ -4,7 +4,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use pulsar_proto::{decode, encode, ClientMsg, DeviceId, ErrCode, RelayMsg, Token, PROTOCOL_VERSION};
+use pulsar_proto::{
+	decode, encode, ClientMsg, DeviceId, ErrCode, RelayMsg, Token, PROTOCOL_VERSION,
+};
 use pulsar_relay::Relay;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -199,7 +201,10 @@ async fn full_rendezvous_and_relay_forwarding() {
 	)
 	.await;
 	match recv(&b).await {
-		RelayMsg::RelayData { session: s, payload } => {
+		RelayMsg::RelayData {
+			session: s,
+			payload,
+		} => {
 			assert_eq!(s, session);
 			assert_eq!(payload, vec![9, 9, 9]);
 		}
