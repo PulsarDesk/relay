@@ -36,12 +36,19 @@ async fn recv(sock: &UdpSocket) -> RelayMsg {
 }
 
 async fn register(sock: &UdpSocket, relay: SocketAddr, name: &str) -> (DeviceId, Token) {
+	// Derive a distinct pubkey per device name — real devices have distinct
+	// identities, and the relay now maps pubkey → id (stable id), so two different
+	// devices must present different pubkeys (and the same name → same identity).
+	let mut pubkey = [0u8; 32];
+	for (i, b) in name.bytes().take(32).enumerate() {
+		pubkey[i] = b;
+	}
 	send(
 		sock,
 		relay,
 		&ClientMsg::Register {
 			version: PROTOCOL_VERSION,
-			pubkey: [0u8; 32],
+			pubkey,
 			name: Some(name.into()),
 		},
 	)
@@ -62,6 +69,18 @@ async fn registration_assigns_unique_nine_digit_ids() {
 	assert_ne!(id_a, id_b, "two devices got the same id");
 	assert_eq!(id_a.0.to_string().len(), 9);
 	assert_eq!(id_b.0.to_string().len(), 9);
+}
+
+#[tokio::test]
+async fn same_identity_keeps_its_id_across_reregistration() {
+	// A device that persists its identity (same pubkey) must get the SAME 9-digit id
+	// when it re-registers — this is what makes the user's device ID stable.
+	let relay = start_relay().await;
+	let first = client().await;
+	let (id1, _) = register(&first, relay, "Stable").await;
+	let again = client().await;
+	let (id2, _) = register(&again, relay, "Stable").await; // same name → same pubkey
+	assert_eq!(id1, id2, "same identity must keep its id across re-registration");
 }
 
 #[tokio::test]

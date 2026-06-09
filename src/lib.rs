@@ -11,13 +11,18 @@
 //! The server is a single-task UDP event loop, so its state needs no locking.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use pulsar_proto::{
 	decode, encode, ClientMsg, DeviceId, ErrCode, PublicKey, RelayMsg, SessionId, Token,
 };
 use tokio::net::UdpSocket;
 use tokio::time::{Duration, Instant};
+
+mod limits;
+
+use limits::{Meter, METER_TTL};
+pub use limits::{parse_rate, parse_size, Limits};
 
 /// How long a device may go without a heartbeat before it's reaped.
 pub const DEVICE_TTL: Duration = Duration::from_secs(30);
@@ -49,6 +54,15 @@ pub struct Relay {
 	sock: UdpSocket,
 	devices: HashMap<DeviceId, Device>,
 	sessions: HashMap<SessionId, Session>,
+	/// Stable mapping pubkey → id so a returning device keeps the SAME 9-digit ID
+	/// across reconnects/restarts (the client persists its identity). Survives the
+	/// device's TTL eviction; only cleared when the relay process restarts.
+	by_pubkey: HashMap<PublicKey, DeviceId>,
+	/// Operator bandwidth limits (default: unlimited — see [`Limits`]).
+	limits: Limits,
+	/// Per-device + per-IP rate/volume meters (only populated when a limit is set).
+	user_meters: HashMap<DeviceId, Meter>,
+	ip_meters: HashMap<IpAddr, Meter>,
 }
 
 impl Relay {
@@ -59,7 +73,18 @@ impl Relay {
 			sock,
 			devices: HashMap::new(),
 			sessions: HashMap::new(),
+			by_pubkey: HashMap::new(),
+			limits: Limits::default(),
+			user_meters: HashMap::new(),
+			ip_meters: HashMap::new(),
 		})
+	}
+
+	/// Apply operator bandwidth limits (builder; default is unlimited). Used by both the
+	/// standalone `pulsar-relay` binary and the desktop app's `--relay` mode.
+	pub fn with_limits(mut self, limits: Limits) -> Self {
+		self.limits = limits;
+		self
 	}
 
 	/// The actual bound address (useful after binding to port 0).
@@ -205,18 +230,26 @@ impl Relay {
 				if !self.authed(id, token) {
 					return Some((Self::err(ErrCode::BadToken, "auth failed"), from));
 				}
-				let Some(sess) = self.sessions.get_mut(&session) else {
-					return Some((Self::err(ErrCode::Protocol, "no such session"), from));
+				// Resolve the other end of the session (scoped so the borrow ends before
+				// the rate-limit check below mutates the meter maps).
+				let dest = {
+					let Some(sess) = self.sessions.get_mut(&session) else {
+						return Some((Self::err(ErrCode::Protocol, "no such session"), from));
+					};
+					sess.last_seen = Self::now();
+					if id == sess.requester {
+						sess.target_addr
+					} else if id == sess.target {
+						sess.requester_addr
+					} else {
+						return Some((Self::err(ErrCode::Protocol, "not a session member"), from));
+					}
 				};
-				sess.last_seen = Self::now();
-				// Forward to the *other* end of the session.
-				let dest = if id == sess.requester {
-					sess.target_addr
-				} else if id == sess.target {
-					sess.requester_addr
-				} else {
-					return Some((Self::err(ErrCode::Protocol, "not a session member"), from));
-				};
+				// Operator bandwidth limits: silently drop (don't forward) when the
+				// sending device / source IP is over its rate or volume cap.
+				if !self.allow(id, from.ip(), payload.len()) {
+					return None;
+				}
 				Some((encode(&RelayMsg::RelayData { session, payload }), dest))
 			}
 
@@ -238,10 +271,20 @@ impl Relay {
 		name: Option<String>,
 	) -> (DeviceId, Token) {
 		let mut rng = rand::thread_rng();
-		let id = loop {
-			let candidate = DeviceId::random(&mut rng);
-			if !self.devices.contains_key(&candidate) {
-				break candidate;
+		// A device that registered before (same persisted identity) keeps its id, so
+		// the user's 9-digit ID is stable across restarts. Only mint a new id for a
+		// pubkey we've never seen.
+		let id = match self.by_pubkey.get(&pubkey) {
+			Some(&existing) => existing,
+			None => {
+				let fresh = loop {
+					let candidate = DeviceId::random(&mut rng);
+					if !self.devices.contains_key(&candidate) && !self.by_pubkey.values().any(|v| *v == candidate) {
+						break candidate;
+					}
+				};
+				self.by_pubkey.insert(pubkey, fresh);
+				fresh
 			}
 		};
 		let token = Token::random(&mut rng);
@@ -262,6 +305,45 @@ impl Relay {
 		self.devices.get(&id).is_some_and(|d| d.token == token)
 	}
 
+	/// Charge a `sz`-byte relayed datagram (from device `id` / source `ip`) against the
+	/// operator limits. Returns false when over the rate or volume cap; the caller then
+	/// drops the datagram. No-op (always true) when no limit is configured.
+	fn allow(&mut self, id: DeviceId, ip: IpAddr, sz: usize) -> bool {
+		if self.limits.is_unlimited() {
+			return true;
+		}
+		let now = Self::now();
+		let sz = sz as u64;
+		let (ubps, utot) = (self.limits.per_user_bps, self.limits.per_user_total);
+		let (ibps, itot) = (self.limits.per_ip_bps, self.limits.per_ip_total);
+		let user_active = ubps.is_some() || utot.is_some();
+		let ip_active = ibps.is_some() || itot.is_some();
+		// Dry-run both meters against the SAME `now` before charging either, so a reject by
+		// one meter never consumes rate-bucket tokens / volume from the other. (Charging the
+		// user meter first and only then discovering the IP meter rejects would otherwise
+		// burn a device's own cap for bytes the relay never forwarded.)
+		if user_active {
+			let m = self.user_meters.entry(id).or_insert_with(|| Meter::new(now));
+			if !m.would_allow(now, sz, ubps, utot) {
+				return false;
+			}
+		}
+		if ip_active {
+			let m = self.ip_meters.entry(ip).or_insert_with(|| Meter::new(now));
+			if !m.would_allow(now, sz, ibps, itot) {
+				return false;
+			}
+		}
+		// Both approved → commit. The same `now` makes each refill an identical no-op delta.
+		if user_active {
+			self.user_meters.get_mut(&id).unwrap().charge(now, sz, ubps, utot);
+		}
+		if ip_active {
+			self.ip_meters.get_mut(&ip).unwrap().charge(now, sz, ibps, itot);
+		}
+		true
+	}
+
 	fn err(code: ErrCode, message: &str) -> Vec<u8> {
 		encode(&RelayMsg::Error {
 			code,
@@ -276,5 +358,10 @@ impl Relay {
 			.retain(|_, d| now.duration_since(d.last_seen) < DEVICE_TTL);
 		self.sessions
 			.retain(|_, s| now.duration_since(s.last_seen) < SESSION_TTL);
+		// Reap idle rate-limit meters so the maps don't grow unbounded.
+		self.user_meters
+			.retain(|_, m| now.saturating_duration_since(m.last_active) < METER_TTL);
+		self.ip_meters
+			.retain(|_, m| now.saturating_duration_since(m.last_active) < METER_TTL);
 	}
 }
