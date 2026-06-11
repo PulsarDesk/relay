@@ -80,7 +80,10 @@ async fn same_identity_keeps_its_id_across_reregistration() {
 	let (id1, _) = register(&first, relay, "Stable").await;
 	let again = client().await;
 	let (id2, _) = register(&again, relay, "Stable").await; // same name → same pubkey
-	assert_eq!(id1, id2, "same identity must keep its id across re-registration");
+	assert_eq!(
+		id1, id2,
+		"same identity must keep its id across re-registration"
+	);
 }
 
 #[tokio::test]

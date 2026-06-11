@@ -40,18 +40,22 @@ struct Args {
 
 fn opt_rate(v: &Option<String>, what: &str) -> anyhow::Result<Option<u64>> {
 	match v {
-		Some(s) => Ok(Some(
-			parse_rate(s).ok_or_else(|| anyhow::anyhow!("invalid {what} rate: {s:?}"))?,
-		)),
+		Some(s) => {
+			Ok(Some(parse_rate(s).ok_or_else(|| {
+				anyhow::anyhow!("invalid {what} rate: {s:?}")
+			})?))
+		}
 		None => Ok(None),
 	}
 }
 
 fn opt_size(v: &Option<String>, what: &str) -> anyhow::Result<Option<u64>> {
 	match v {
-		Some(s) => Ok(Some(
-			parse_size(s).ok_or_else(|| anyhow::anyhow!("invalid {what} size: {s:?}"))?,
-		)),
+		Some(s) => {
+			Ok(Some(parse_size(s).ok_or_else(|| {
+				anyhow::anyhow!("invalid {what} size: {s:?}")
+			})?))
+		}
 		None => Ok(None),
 	}
 }

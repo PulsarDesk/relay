@@ -75,7 +75,13 @@ impl Meter {
 	/// volume cap? Computes the projected token count from `now` but writes nothing, so the
 	/// caller can verify several meters before committing any of them. Pair with the same
 	/// `now` in [`charge`] so the committing refill is an identical no-op delta.
-	pub(crate) fn would_allow(&self, now: Instant, sz: u64, bps: Option<u64>, total: Option<u64>) -> bool {
+	pub(crate) fn would_allow(
+		&self,
+		now: Instant,
+		sz: u64,
+		bps: Option<u64>,
+		total: Option<u64>,
+	) -> bool {
 		if let Some(cap) = total {
 			if self.total.saturating_add(sz) > cap {
 				return false;
@@ -91,7 +97,13 @@ impl Meter {
 
 	/// Charge `sz` bytes against this meter; returns false (drop) if it would exceed the
 	/// rate bucket or the volume cap. A dropped datagram is NOT counted toward the total.
-	pub(crate) fn charge(&mut self, now: Instant, sz: u64, bps: Option<u64>, total: Option<u64>) -> bool {
+	pub(crate) fn charge(
+		&mut self,
+		now: Instant,
+		sz: u64,
+		bps: Option<u64>,
+		total: Option<u64>,
+	) -> bool {
 		self.last_active = now;
 		if let Some(cap) = total {
 			if self.total.saturating_add(sz) > cap {
@@ -200,7 +212,7 @@ mod tests {
 		// 1000 bytes pass, then further bytes in the same instant are dropped.
 		assert!(m.charge(t0, 1000, Some(1000), None));
 		assert!(!m.charge(t0, 1, Some(1000), None)); // bucket empty → dropped
-		// After ~1s the bucket refills enough for another 1000 bytes.
+											   // After ~1s the bucket refills enough for another 1000 bytes.
 		let t1 = t0 + Duration::from_secs(1);
 		assert!(m.charge(t1, 1000, Some(1000), None));
 	}

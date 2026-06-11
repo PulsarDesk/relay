@@ -21,13 +21,17 @@ use tokio::time::{Duration, Instant};
 
 mod limits;
 
-use limits::{Meter, METER_TTL};
 pub use limits::{parse_rate, parse_size, Limits};
+use limits::{Meter, METER_TTL};
 
 /// How long a device may go without a heartbeat before it's reaped.
 pub const DEVICE_TTL: Duration = Duration::from_secs(30);
 /// How long a rendezvous session lingers without traffic.
 pub const SESSION_TTL: Duration = Duration::from_secs(120);
+/// How long an OFFLINE device keeps its pubkey→id mapping. Long enough that any
+/// realistic reconnect gap preserves the user's 9-digit ID, but bounds the map on
+/// a long-running public relay with device churn (it would otherwise grow forever).
+pub const PUBKEY_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 #[derive(Debug, Clone)]
 struct Device {
@@ -54,10 +58,11 @@ pub struct Relay {
 	sock: UdpSocket,
 	devices: HashMap<DeviceId, Device>,
 	sessions: HashMap<SessionId, Session>,
-	/// Stable mapping pubkey → id so a returning device keeps the SAME 9-digit ID
-	/// across reconnects/restarts (the client persists its identity). Survives the
-	/// device's TTL eviction; only cleared when the relay process restarts.
-	by_pubkey: HashMap<PublicKey, DeviceId>,
+	/// Stable mapping pubkey → (id, last-used) so a returning device keeps the SAME
+	/// 9-digit ID across reconnects/restarts (the client persists its identity).
+	/// Survives the device's TTL eviction; gc() refreshes entries of registered
+	/// devices and reaps mappings offline past [`PUBKEY_TTL`].
+	by_pubkey: HashMap<PublicKey, (DeviceId, Instant)>,
 	/// Operator bandwidth limits (default: unlimited — see [`Limits`]).
 	limits: Limits,
 	/// Per-device + per-IP rate/volume meters (only populated when a limit is set).
@@ -99,7 +104,19 @@ impl Relay {
 		loop {
 			tokio::select! {
 				res = self.sock.recv_from(&mut buf) => {
-					let (n, from) = res?;
+					let (n, from) = match res {
+						Ok(v) => v,
+						// Per-peer noise, not a socket failure: on Windows an unconnected
+						// UDP socket reports a prior send_to's ICMP port-unreachable as
+						// ConnectionReset on the NEXT recv_from — any client that exits
+						// mid-session would otherwise take the whole relay down.
+						Err(e) if matches!(
+							e.kind(),
+							std::io::ErrorKind::ConnectionReset
+								| std::io::ErrorKind::ConnectionRefused
+						) => continue,
+						Err(e) => return Err(e),
+					};
 					// One malformed datagram must never take the relay down.
 					if let Some((bytes, to)) = self.handle(&buf[..n], from) {
 						let _ = self.sock.send_to(&bytes, to).await;
@@ -271,19 +288,25 @@ impl Relay {
 		name: Option<String>,
 	) -> (DeviceId, Token) {
 		let mut rng = rand::thread_rng();
+		let now = Self::now();
 		// A device that registered before (same persisted identity) keeps its id, so
 		// the user's 9-digit ID is stable across restarts. Only mint a new id for a
-		// pubkey we've never seen.
-		let id = match self.by_pubkey.get(&pubkey) {
-			Some(&existing) => existing,
+		// pubkey we've never seen (or one reaped after PUBKEY_TTL offline).
+		let id = match self.by_pubkey.get_mut(&pubkey) {
+			Some(entry) => {
+				entry.1 = now;
+				entry.0
+			}
 			None => {
 				let fresh = loop {
 					let candidate = DeviceId::random(&mut rng);
-					if !self.devices.contains_key(&candidate) && !self.by_pubkey.values().any(|v| *v == candidate) {
+					if !self.devices.contains_key(&candidate)
+						&& !self.by_pubkey.values().any(|&(v, _)| v == candidate)
+					{
 						break candidate;
 					}
 				};
-				self.by_pubkey.insert(pubkey, fresh);
+				self.by_pubkey.insert(pubkey, (fresh, now));
 				fresh
 			}
 		};
@@ -323,23 +346,37 @@ impl Relay {
 		// user meter first and only then discovering the IP meter rejects would otherwise
 		// burn a device's own cap for bytes the relay never forwarded.)
 		if user_active {
-			let m = self.user_meters.entry(id).or_insert_with(|| Meter::new(now));
+			let m = self
+				.user_meters
+				.entry(id)
+				.or_insert_with(|| Meter::new(now));
+			// Every consult counts as activity, REJECTED datagrams included: an over-cap
+			// sender that keeps transmitting must not let its meter go "idle", get reaped
+			// by gc(), and be reborn with a fresh volume allowance every METER_TTL.
+			m.last_active = now;
 			if !m.would_allow(now, sz, ubps, utot) {
 				return false;
 			}
 		}
 		if ip_active {
 			let m = self.ip_meters.entry(ip).or_insert_with(|| Meter::new(now));
+			m.last_active = now;
 			if !m.would_allow(now, sz, ibps, itot) {
 				return false;
 			}
 		}
 		// Both approved → commit. The same `now` makes each refill an identical no-op delta.
 		if user_active {
-			self.user_meters.get_mut(&id).unwrap().charge(now, sz, ubps, utot);
+			self.user_meters
+				.get_mut(&id)
+				.unwrap()
+				.charge(now, sz, ubps, utot);
 		}
 		if ip_active {
-			self.ip_meters.get_mut(&ip).unwrap().charge(now, sz, ibps, itot);
+			self.ip_meters
+				.get_mut(&ip)
+				.unwrap()
+				.charge(now, sz, ibps, itot);
 		}
 		true
 	}
@@ -353,15 +390,58 @@ impl Relay {
 
 	/// Drop stale devices and sessions.
 	fn gc(&mut self) {
-		let now = Self::now();
+		self.gc_at(Self::now());
+	}
+
+	/// [`Self::gc`] against an explicit `now`, so tests can drive long horizons.
+	fn gc_at(&mut self, now: Instant) {
 		self.devices
 			.retain(|_, d| now.duration_since(d.last_seen) < DEVICE_TTL);
 		self.sessions
 			.retain(|_, s| now.duration_since(s.last_seen) < SESSION_TTL);
+		// The stable-ID map: keep refreshing entries whose device is still registered
+		// (a host online for months must not lose its mapping), and reap entries that
+		// have been offline past PUBKEY_TTL so the map stays bounded under churn.
+		let devices = &self.devices;
+		self.by_pubkey.retain(|_, e| {
+			if devices.contains_key(&e.0) {
+				e.1 = now;
+				true
+			} else {
+				now.saturating_duration_since(e.1) < PUBKEY_TTL
+			}
+		});
 		// Reap idle rate-limit meters so the maps don't grow unbounded.
 		self.user_meters
 			.retain(|_, m| now.saturating_duration_since(m.last_active) < METER_TTL);
 		self.ip_meters
 			.retain(|_, m| now.saturating_duration_since(m.last_active) < METER_TTL);
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[tokio::test]
+	async fn stable_id_survives_offline_gap_but_pubkey_ttl_bounds_the_map() {
+		let mut relay = Relay::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+		let addr: SocketAddr = "203.0.113.9:1000".parse().unwrap();
+		let pk: PublicKey = [7u8; 32];
+		let t0 = Instant::now();
+		let (id, _) = relay.register(addr, pk, None);
+		// A day offline: the device itself is long evicted, but the pubkey→id
+		// mapping survives, so re-registering yields the SAME 9-digit ID.
+		let day = Duration::from_secs(24 * 60 * 60);
+		relay.gc_at(t0 + day);
+		assert_eq!(relay.device_count(), 0, "offline device must be evicted");
+		let (id2, _) = relay.register(addr, pk, None);
+		assert_eq!(id, id2, "id must be stable across an offline gap");
+		// Offline past PUBKEY_TTL: the mapping is reaped so the map stays bounded.
+		relay.gc_at(t0 + day + PUBKEY_TTL + Duration::from_secs(1));
+		assert!(
+			relay.by_pubkey.is_empty(),
+			"stale pubkey mapping must be reaped"
+		);
 	}
 }
