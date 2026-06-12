@@ -15,6 +15,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use pulsar_proto::{
 	decode, encode, ClientMsg, DeviceId, ErrCode, PublicKey, RelayMsg, SessionId, Token,
+	MAX_DATAGRAM,
 };
 use tokio::net::UdpSocket;
 use tokio::time::{Duration, Instant};
@@ -32,6 +33,16 @@ pub const SESSION_TTL: Duration = Duration::from_secs(120);
 /// realistic reconnect gap preserves the user's 9-digit ID, but bounds the map on
 /// a long-running public relay with device churn (it would otherwise grow forever).
 pub const PUBKEY_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// Hard upper bound on a single `RelayData` payload the relay will forward,
+/// enforced UNCONDITIONALLY — independent of the (default-off) operator bandwidth
+/// limiter. Without this the relay is a full-rate UDP reflector: any session member
+/// can have us blast arbitrarily large datagrams at the other peer. Sessions only
+/// carry the small E2E-encrypted control channel (bulk A/V goes direct UDP, never
+/// through the relay), so a generous multiple of the MTU-safe `MAX_DATAGRAM` leaves
+/// ample headroom for legitimate control payloads + crypto/framing overhead while
+/// still capping the reflection/amplification surface. Oversized datagrams are
+/// dropped (UDP — the sender's stream adapts).
+pub const MAX_RELAY_PAYLOAD: usize = 16 * MAX_DATAGRAM;
 
 #[derive(Debug, Clone)]
 struct Device {
@@ -186,6 +197,18 @@ impl Relay {
 				let Some(tdev) = self.devices.get(&target).cloned() else {
 					return Some((Self::err(ErrCode::TargetOffline, "target not online"), from));
 				};
+				// Session ownership: a SessionId is bound to the device that first created
+				// it. Reject a Connect whose SessionId already exists under a DIFFERENT
+				// requester — otherwise any registered device could pick a live session's
+				// id and overwrite its record (requester/target/addrs), hijacking the
+				// victim's relay path (redirect/blackhole + insert itself as a member).
+				// A legitimate retry from the SAME requester (same id) is allowed and just
+				// refreshes its own record (new target/addr/hello on re-Connect).
+				if let Some(existing) = self.sessions.get(&session) {
+					if existing.requester != id {
+						return Some((Self::err(ErrCode::Protocol, "session id in use"), from));
+					}
+				}
 				self.sessions.insert(
 					session,
 					Session {
@@ -247,6 +270,13 @@ impl Relay {
 				if !self.authed(id, token) {
 					return Some((Self::err(ErrCode::BadToken, "auth failed"), from));
 				}
+				// Hard payload cap, enforced regardless of operator bandwidth limits (which
+				// are off by default): drop oversized datagrams so the relay can't be used as
+				// a full-rate UDP reflector/amplifier toward a session peer. Sessions carry
+				// only the small control channel — anything this large is abuse or a bug.
+				if payload.len() > MAX_RELAY_PAYLOAD {
+					return None;
+				}
 				// Resolve the other end of the session (scoped so the borrow ends before
 				// the rate-limit check below mutates the meter maps).
 				let dest = {
@@ -287,6 +317,12 @@ impl Relay {
 		pubkey: PublicKey,
 		name: Option<String>,
 	) -> (DeviceId, Token) {
+		// TODO(security, low priority): registration is unauthenticated, so a flood of
+		// distinct pubkeys can grow `devices` / `by_pubkey` until DEVICE_TTL / PUBKEY_TTL
+		// reap them (PUBKEY_TTL is 30 days → a sustained churn attack inflates the map for
+		// a long time). A proper fix is a per-IP registration rate/quota meter (reuse the
+		// `Meter` infra) or a lightweight proof-of-work on Register. Not trivial to do well
+		// (NAT shares IPs; PoW needs a proto change), so deferred rather than half-done here.
 		let mut rng = rand::thread_rng();
 		let now = Self::now();
 		// A device that registered before (same persisted identity) keeps its id, so
@@ -443,5 +479,49 @@ mod tests {
 			relay.by_pubkey.is_empty(),
 			"stale pubkey mapping must be reaped"
 		);
+	}
+
+	// A SessionId is owned by its creating requester: a second device can't reuse a
+	// live session's id to overwrite (hijack) its record. The owner's own retry can.
+	#[tokio::test]
+	async fn connect_cannot_hijack_another_devices_session_id() {
+		let mut relay = Relay::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+		let a: SocketAddr = "203.0.113.1:1".parse().unwrap();
+		let b: SocketAddr = "203.0.113.2:2".parse().unwrap();
+		let c: SocketAddr = "203.0.113.3:3".parse().unwrap();
+		let (a_id, a_tok) = relay.register(a, [1u8; 32], None);
+		let (b_id, _b_tok) = relay.register(b, [2u8; 32], None);
+		let (c_id, c_tok) = relay.register(c, [3u8; 32], None);
+		let session: SessionId = 0xABCD;
+
+		// A → B establishes the session.
+		let connect = |id, token, target, addr: SocketAddr| {
+			move |relay: &mut Relay| {
+				relay.handle(
+					&encode(&ClientMsg::Connect {
+						id,
+						token,
+						target,
+						session,
+						hello: vec![],
+					}),
+					addr,
+				)
+			}
+		};
+		assert!(connect(a_id, a_tok, b_id, a)(&mut relay).is_some());
+		let sess = relay.sessions.get(&session).cloned().unwrap();
+		assert_eq!(sess.requester, a_id);
+
+		// C tries to hijack the SAME session id → rejected, record untouched.
+		let reply = connect(c_id, c_tok, b_id, c)(&mut relay);
+		assert!(reply.is_some(), "hijack attempt should get an error reply");
+		let after = relay.sessions.get(&session).unwrap();
+		assert_eq!(after.requester, a_id, "owner's session must be unchanged");
+		assert_ne!(after.requester, c_id, "attacker must not become the requester");
+
+		// A's own retry (same requester) is allowed and refreshes the record.
+		assert!(connect(a_id, a_tok, b_id, a)(&mut relay).is_some());
+		assert_eq!(relay.sessions.get(&session).unwrap().requester, a_id);
 	}
 }
