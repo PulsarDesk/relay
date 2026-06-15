@@ -10,12 +10,12 @@
 //!
 //! The server is a single-task UDP event loop, so its state needs no locking.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 
 use pulsar_proto::{
 	decode, encode, ClientMsg, DeviceId, ErrCode, PublicKey, RelayMsg, SessionId, Token,
-	MAX_DATAGRAM,
+	MAX_DATAGRAM, PROTOCOL_VERSION,
 };
 use tokio::net::UdpSocket;
 use tokio::time::{Duration, Instant};
@@ -33,6 +33,17 @@ pub const SESSION_TTL: Duration = Duration::from_secs(120);
 /// realistic reconnect gap preserves the user's 9-digit ID, but bounds the map on
 /// a long-running public relay with device churn (it would otherwise grow forever).
 pub const PUBKEY_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// Hard cap on a stored device name (the attacker-controlled `ClientMsg::Register.name`).
+/// Registration is unauthenticated, so without a cap a flood of huge names multiplies the
+/// per-entry memory of `devices` / `by_pubkey`. Names are only ever a short human label,
+/// so anything longer is truncated (on a char boundary) before it's stored.
+pub const MAX_NAME_LEN: usize = 64;
+/// Upper bound on the number of stable pubkey→id mappings the relay retains. PUBKEY_TTL is
+/// 30 days, so without a size cap an unauthenticated Register flood (fresh pubkey each time)
+/// could pin the map's memory for a month. Far above any realistic fleet, so it only trips
+/// under abuse; when full, the OLDEST mapping whose device is currently OFFLINE is evicted
+/// (online devices keep their IDs). A new pubkey is dropped only if every mapping is online.
+pub const MAX_PUBKEY_MAPPINGS: usize = 100_000;
 /// Hard upper bound on a single `RelayData` payload the relay will forward,
 /// enforced UNCONDITIONALLY — independent of the (default-off) operator bandwidth
 /// limiter. Without this the relay is a full-rate UDP reflector: any session member
@@ -43,6 +54,16 @@ pub const PUBKEY_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// still capping the reflection/amplification surface. Oversized datagrams are
 /// dropped (UDP — the sender's stream adapts).
 pub const MAX_RELAY_PAYLOAD: usize = 16 * MAX_DATAGRAM;
+/// Hard upper bound on the `hello` handshake blob a `ClientMsg::Connect` may carry, enforced
+/// UNCONDITIONALLY (independent of the default-off operator bandwidth limiter). The relay
+/// forwards this attacker-controllable blob verbatim inside a `RelayMsg::Incoming` to the
+/// target's address, so without a cap any registered device can have us emit a large,
+/// hello-padded datagram at a third party — a reflection/amplification primitive. A legitimate
+/// `hello` is only `pubkey(32) || salt(32) || optional LAN candidate(6)` ≈ 70 bytes; one
+/// MTU-safe datagram leaves ample headroom for that plus any future handshake extension while
+/// keeping the forwarded `Incoming` close to the size of the `Connect` that triggered it (no
+/// meaningful amplification). Oversized Connects are dropped (UDP — the sender adapts).
+pub const MAX_HELLO_LEN: usize = MAX_DATAGRAM;
 
 #[derive(Debug, Clone)]
 struct Device {
@@ -74,6 +95,12 @@ pub struct Relay {
 	/// Survives the device's TTL eviction; gc() refreshes entries of registered
 	/// devices and reaps mappings offline past [`PUBKEY_TTL`].
 	by_pubkey: HashMap<PublicKey, (DeviceId, Instant)>,
+	/// Reverse index of every id currently held in [`Self::by_pubkey`], kept exactly in
+	/// sync with its value set. Lets id minting test a candidate for collision in O(1)
+	/// instead of an O(n) scan of `by_pubkey` — without it a Register flood makes each new
+	/// registration cost more CPU as the map grows (a super-linear feedback loop that, on a
+	/// single-task event loop, stalls all clients).
+	assigned_ids: HashSet<DeviceId>,
 	/// Operator bandwidth limits (default: unlimited — see [`Limits`]).
 	limits: Limits,
 	/// Per-device + per-IP rate/volume meters (only populated when a limit is set).
@@ -90,6 +117,7 @@ impl Relay {
 			devices: HashMap::new(),
 			sessions: HashMap::new(),
 			by_pubkey: HashMap::new(),
+			assigned_ids: HashSet::new(),
 			limits: Limits::default(),
 			user_meters: HashMap::new(),
 			ip_meters: HashMap::new(),
@@ -157,10 +185,22 @@ impl Relay {
 
 		match msg {
 			ClientMsg::Register {
-				version: _,
+				version,
 				pubkey,
 				name,
 			} => {
+				// Reject an incompatible wire version up front. The per-session handshake
+				// blob format is version-specific (v2 added a 32-byte salt), so a mismatched
+				// peer otherwise registers fine and the incompatibility only surfaces later
+				// as a misleading rendezvous/handshake TIMEOUT. A typed error here lets the
+				// client show a clear "update required" message instead.
+				if version != PROTOCOL_VERSION {
+					tracing::warn!(%from, version, expected = PROTOCOL_VERSION, "rejecting register: incompatible protocol version");
+					return Some((
+						Self::err(ErrCode::IncompatibleVersion, "incompatible protocol version"),
+						from,
+					));
+				}
 				let (id, token) = self.register(from, pubkey, name);
 				tracing::info!(%id, %from, "device registered");
 				Some((encode(&RelayMsg::Registered { id, token }), from))
@@ -189,6 +229,13 @@ impl Relay {
 				if !self.authed(id, token) {
 					return Some((Self::err(ErrCode::BadToken, "auth failed"), from));
 				}
+				// Cap the attacker-controllable `hello` blob, enforced UNCONDITIONALLY (like
+				// MAX_RELAY_PAYLOAD): it's forwarded verbatim in the Incoming below, so an
+				// oversized hello turns Connect into a reflection/amplification primitive
+				// toward the target's address. A real handshake is ~70 bytes (see MAX_HELLO_LEN).
+				if hello.len() > MAX_HELLO_LEN {
+					return None;
+				}
 				// keep requester's observed addr fresh
 				if let Some(dev) = self.devices.get_mut(&id) {
 					dev.addr = from;
@@ -208,6 +255,16 @@ impl Relay {
 					if existing.requester != id {
 						return Some((Self::err(ErrCode::Protocol, "session id in use"), from));
 					}
+				}
+				// Charge the forwarded Incoming against the operator bandwidth limits (same
+				// meter as RelayData) so Connect-spam counts toward an over-cap sender's
+				// per-device / per-source-IP budget instead of being a free reflection path.
+				// No-op when no limit is configured (the default).
+				// IMPORTANT: evaluated BEFORE sessions.insert so a cap-rejected Connect
+				// does not leave a stale session record in the map (the session is never
+				// inserted, so there is nothing to clean up on the early return).
+				if !self.allow(id, from.ip(), hello.len()) {
+					return None;
 				}
 				self.sessions.insert(
 					session,
@@ -240,6 +297,15 @@ impl Relay {
 				if !self.authed(id, token) {
 					return Some((Self::err(ErrCode::BadToken, "auth failed"), from));
 				}
+				// Cap the attacker-controllable `answer` blob, enforced UNCONDITIONALLY (like
+				// MAX_RELAY_PAYLOAD and the hello cap on Connect): it's forwarded verbatim in
+				// PeerFound below, so an oversized answer turns Accept into a
+				// reflection/amplification primitive toward the requester's address — the same
+				// surface the hello cap closed on the Connect side. A real answer is the same
+				// ~70-byte pubkey||salt as hello (see MAX_HELLO_LEN).
+				if answer.len() > MAX_HELLO_LEN {
+					return None;
+				}
 				let Some(sess) = self.sessions.get_mut(&session) else {
 					return Some((Self::err(ErrCode::Protocol, "no such session"), from));
 				};
@@ -248,7 +314,16 @@ impl Relay {
 				}
 				sess.target_addr = from;
 				sess.last_seen = Self::now();
+				let requester_id = sess.requester;
 				let requester_addr = sess.requester_addr;
+				// Charge the forwarded PeerFound against the operator bandwidth limits so
+				// Accept-spam from an over-cap target counts toward its per-device / per-IP
+				// budget instead of being a free reflection path — mirrors the allow() call on
+				// the Connect side. No-op when no limit is configured (the default).
+				if !self.allow(id, from.ip(), answer.len()) {
+					return None;
+				}
+				let _ = requester_id; // used for symmetry with Connect; may wire to metrics later
 				// Tell the requester the target accepted, with the target's address.
 				Some((
 					encode(&RelayMsg::PeerFound {
@@ -317,14 +392,28 @@ impl Relay {
 		pubkey: PublicKey,
 		name: Option<String>,
 	) -> (DeviceId, Token) {
-		// TODO(security, low priority): registration is unauthenticated, so a flood of
-		// distinct pubkeys can grow `devices` / `by_pubkey` until DEVICE_TTL / PUBKEY_TTL
-		// reap them (PUBKEY_TTL is 30 days → a sustained churn attack inflates the map for
-		// a long time). A proper fix is a per-IP registration rate/quota meter (reuse the
-		// `Meter` infra) or a lightweight proof-of-work on Register. Not trivial to do well
-		// (NAT shares IPs; PoW needs a proto change), so deferred rather than half-done here.
+		// Registration is unauthenticated, so a flood of distinct pubkeys would otherwise
+		// inflate `devices` / `by_pubkey`. Three bounds keep that flood cheap and capped:
+		// (1) id minting checks `assigned_ids` in O(1) instead of an O(n) scan of `by_pubkey`
+		//     (the scan made each registration cost more as the map grew — a super-linear
+		//     feedback loop that stalls the single-task event loop under churn);
+		// (2) the attacker-controlled `name` is truncated to MAX_NAME_LEN before storage so a
+		//     single entry can't pin unbounded memory;
+		// (3) `by_pubkey` is capped at MAX_PUBKEY_MAPPINGS so the 30-day PUBKEY_TTL can't let
+		//     churn pin the map for a month — when full we evict the oldest OFFLINE mapping.
 		let mut rng = rand::thread_rng();
 		let now = Self::now();
+		let name = name.map(|mut n| {
+			if n.len() > MAX_NAME_LEN {
+				// Truncate on a char boundary so multi-byte UTF-8 names don't panic.
+				let cut = (0..=MAX_NAME_LEN)
+					.rev()
+					.find(|&i| n.is_char_boundary(i))
+					.unwrap_or(0);
+				n.truncate(cut);
+			}
+			n
+		});
 		// A device that registered before (same persisted identity) keeps its id, so
 		// the user's 9-digit ID is stable across restarts. Only mint a new id for a
 		// pubkey we've never seen (or one reaped after PUBKEY_TTL offline).
@@ -334,15 +423,20 @@ impl Relay {
 				entry.0
 			}
 			None => {
+				// Bound the map: if it's full, drop the oldest OFFLINE mapping to make room
+				// (online devices keep their IDs). If every mapping is online (no abuse), we
+				// just let the map exceed the cap rather than rotate a live device's ID.
+				if self.by_pubkey.len() >= MAX_PUBKEY_MAPPINGS {
+					self.evict_oldest_offline_mapping();
+				}
 				let fresh = loop {
 					let candidate = DeviceId::random(&mut rng);
-					if !self.devices.contains_key(&candidate)
-						&& !self.by_pubkey.values().any(|&(v, _)| v == candidate)
-					{
+					if !self.assigned_ids.contains(&candidate) {
 						break candidate;
 					}
 				};
 				self.by_pubkey.insert(pubkey, (fresh, now));
+				self.assigned_ids.insert(fresh);
 				fresh
 			}
 		};
@@ -360,8 +454,27 @@ impl Relay {
 		(id, token)
 	}
 
+	/// Make room in [`Self::by_pubkey`] when it has hit [`MAX_PUBKEY_MAPPINGS`]: evict the
+	/// oldest (least-recently-used) mapping whose device is NOT currently registered. Online
+	/// devices are never rotated, so a returning device keeps its stable ID; only stale
+	/// offline mappings (the bulk of a flood) are dropped. Does nothing if every mapping is
+	/// online (the map is then allowed to exceed the cap rather than disrupt a live device).
+	fn evict_oldest_offline_mapping(&mut self) {
+		let devices = &self.devices;
+		let victim = self
+			.by_pubkey
+			.iter()
+			.filter(|(_, (id, _))| !devices.contains_key(id))
+			.min_by_key(|(_, (_, last))| *last)
+			.map(|(pk, (id, _))| (*pk, *id));
+		if let Some((pk, id)) = victim {
+			self.by_pubkey.remove(&pk);
+			self.assigned_ids.remove(&id);
+		}
+	}
+
 	fn authed(&self, id: DeviceId, token: Token) -> bool {
-		self.devices.get(&id).is_some_and(|d| d.token == token)
+		self.devices.get(&id).is_some_and(|d| d.token.ct_eq(&token))
 	}
 
 	/// Charge a `sz`-byte relayed datagram (from device `id` / source `ip`) against the
@@ -437,14 +550,19 @@ impl Relay {
 			.retain(|_, s| now.duration_since(s.last_seen) < SESSION_TTL);
 		// The stable-ID map: keep refreshing entries whose device is still registered
 		// (a host online for months must not lose its mapping), and reap entries that
-		// have been offline past PUBKEY_TTL so the map stays bounded under churn.
+		// have been offline past PUBKEY_TTL so the map stays bounded under churn. Keep the
+		// `assigned_ids` reverse index in lock-step: drop the id of every reaped mapping.
 		let devices = &self.devices;
+		let assigned_ids = &mut self.assigned_ids;
 		self.by_pubkey.retain(|_, e| {
 			if devices.contains_key(&e.0) {
 				e.1 = now;
 				true
+			} else if now.saturating_duration_since(e.1) < PUBKEY_TTL {
+				true
 			} else {
-				now.saturating_duration_since(e.1) < PUBKEY_TTL
+				assigned_ids.remove(&e.0);
+				false
 			}
 		});
 		// Reap idle rate-limit meters so the maps don't grow unbounded.
@@ -523,5 +641,172 @@ mod tests {
 		// A's own retry (same requester) is allowed and refreshes the record.
 		assert!(connect(a_id, a_tok, b_id, a)(&mut relay).is_some());
 		assert_eq!(relay.sessions.get(&session).unwrap().requester, a_id);
+	}
+
+	// An over-long, attacker-controlled `hello` blob on a Connect is dropped (no Incoming
+	// forwarded), so Connect can't be used to reflect a large hello-padded datagram at the
+	// target. A normal-sized hello is still forwarded verbatim.
+	#[tokio::test]
+	async fn connect_caps_hello_blob_and_drops_oversized() {
+		let mut relay = Relay::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+		let a: SocketAddr = "203.0.113.1:1".parse().unwrap();
+		let b: SocketAddr = "203.0.113.2:2".parse().unwrap();
+		let (a_id, a_tok) = relay.register(a, [1u8; 32], None);
+		let (b_id, _b_tok) = relay.register(b, [2u8; 32], None);
+		let connect = |hello: Vec<u8>, session: SessionId, relay: &mut Relay| {
+			relay.handle(
+				&encode(&ClientMsg::Connect {
+					id: a_id,
+					token: a_tok,
+					target: b_id,
+					session,
+					hello,
+				}),
+				a,
+			)
+		};
+		// Oversized hello → dropped (no reply, no session created, nothing forwarded).
+		let huge = vec![0u8; MAX_HELLO_LEN + 1];
+		assert!(connect(huge, 0x1111, &mut relay).is_none(), "oversized hello must be dropped");
+		assert!(!relay.sessions.contains_key(&0x1111), "no session for a dropped Connect");
+		// A realistic hello (pubkey||salt||LAN ≈ 70 B) is forwarded to the target's address.
+		let (reply, to) = connect(vec![7u8; 70], 0x2222, &mut relay).expect("normal hello forwarded");
+		assert_eq!(to, b, "Incoming goes to the target's last-seen address");
+		match decode(&reply).unwrap() {
+			RelayMsg::Incoming { hello, .. } => assert_eq!(hello, vec![7u8; 70]),
+			other => panic!("expected Incoming, got {other:?}"),
+		}
+	}
+
+	// An over-long, attacker-controlled `answer` blob on an Accept is dropped (no PeerFound
+	// forwarded), so Accept can't be used to reflect a large answer-padded datagram at the
+	// requester. This is the symmetric cap to connect_caps_hello_blob_and_drops_oversized.
+	// A normal-sized answer is still forwarded verbatim.
+	#[tokio::test]
+	async fn accept_caps_answer_blob_and_drops_oversized() {
+		let mut relay = Relay::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+		let a: SocketAddr = "203.0.113.1:1".parse().unwrap();
+		let b: SocketAddr = "203.0.113.2:2".parse().unwrap();
+		let (a_id, a_tok) = relay.register(a, [1u8; 32], None);
+		let (b_id, b_tok) = relay.register(b, [2u8; 32], None);
+		let session: SessionId = 0xBEEF;
+
+		// Establish the session: A connects to B.
+		relay.handle(
+			&encode(&ClientMsg::Connect {
+				id: a_id,
+				token: a_tok,
+				target: b_id,
+				session,
+				hello: vec![7u8; 70],
+			}),
+			a,
+		);
+		assert!(relay.sessions.contains_key(&session), "session must exist after Connect");
+
+		// B (the target) sends an oversized answer → must be dropped, no PeerFound emitted.
+		let huge_answer = vec![0u8; MAX_HELLO_LEN + 1];
+		let reply = relay.handle(
+			&encode(&ClientMsg::Accept {
+				id: b_id,
+				token: b_tok,
+				session,
+				answer: huge_answer,
+			}),
+			b,
+		);
+		assert!(reply.is_none(), "oversized answer must be dropped — no PeerFound emitted");
+
+		// B sends a normal-sized answer → PeerFound must reach the requester's address.
+		let reply = relay.handle(
+			&encode(&ClientMsg::Accept {
+				id: b_id,
+				token: b_tok,
+				session,
+				answer: vec![9u8; 70],
+			}),
+			b,
+		);
+		let (reply_bytes, to) = reply.expect("normal answer must produce a PeerFound reply");
+		assert_eq!(to, a, "PeerFound goes to the requester's last-seen address");
+		match decode(&reply_bytes).unwrap() {
+			RelayMsg::PeerFound { answer, .. } => assert_eq!(answer, vec![9u8; 70]),
+			other => panic!("expected PeerFound, got {other:?}"),
+		}
+	}
+
+	// An over-long (attacker-controlled) device name is truncated to MAX_NAME_LEN before
+	// storage so a Register flood can't pin unbounded per-entry memory. Truncation is on a
+	// char boundary so multi-byte UTF-8 names never panic.
+	#[tokio::test]
+	async fn register_caps_stored_name_length() {
+		let mut relay = Relay::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+		let addr: SocketAddr = "203.0.113.9:1000".parse().unwrap();
+		let huge = "a".repeat(10_000);
+		let (id, _) = relay.register(addr, [1u8; 32], Some(huge));
+		let stored = relay.devices.get(&id).unwrap().name.as_ref().unwrap();
+		assert!(stored.len() <= MAX_NAME_LEN, "name must be capped");
+		// A multi-byte name truncated near the cap must stay valid UTF-8 (no panic, no split
+		// codepoint): 'ş' is 2 bytes, so MAX_NAME_LEN/2 + a few of them straddle the cap.
+		let multibyte = "ş".repeat(MAX_NAME_LEN); // 2*MAX_NAME_LEN bytes
+		let (id2, _) = relay.register("203.0.113.9:1001".parse().unwrap(), [2u8; 32], Some(multibyte));
+		let stored2 = relay.devices.get(&id2).unwrap().name.as_ref().unwrap();
+		assert!(stored2.len() <= MAX_NAME_LEN);
+		assert!(stored2.chars().all(|c| c == 'ş'), "must not split a codepoint");
+	}
+
+	// The reverse index stays in lock-step with by_pubkey so minted ids are unique and the
+	// O(1) collision check never produces a duplicate. Re-registering a known pubkey keeps
+	// its id and does NOT grow the index; gc reaping a stale mapping shrinks it.
+	#[tokio::test]
+	async fn assigned_ids_mirrors_by_pubkey_value_set() {
+		let mut relay = Relay::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+		let t0 = Instant::now();
+		let (id_a, _) = relay.register("203.0.113.1:1".parse().unwrap(), [1u8; 32], None);
+		let (id_b, _) = relay.register("203.0.113.2:2".parse().unwrap(), [2u8; 32], None);
+		assert_ne!(id_a, id_b, "fresh pubkeys must get distinct ids");
+		assert_eq!(relay.assigned_ids.len(), 2);
+		// Re-registering pubkey A keeps its id and does not grow the index.
+		let (id_a2, _) = relay.register("203.0.113.1:9".parse().unwrap(), [1u8; 32], None);
+		assert_eq!(id_a, id_a2);
+		assert_eq!(relay.assigned_ids.len(), 2);
+		assert!(relay.assigned_ids.contains(&id_a) && relay.assigned_ids.contains(&id_b));
+		// After both devices go offline past PUBKEY_TTL, gc reaps the mappings AND the index.
+		relay.gc_at(t0 + PUBKEY_TTL + Duration::from_secs(1));
+		assert!(relay.by_pubkey.is_empty());
+		assert!(relay.assigned_ids.is_empty(), "reverse index must track reaping");
+	}
+
+	// When by_pubkey hits its size cap, registering a fresh pubkey evicts the OLDEST OFFLINE
+	// mapping — never an online device's — so a flood can't grow the map without bound while
+	// live devices keep their stable IDs.
+	#[tokio::test]
+	async fn full_pubkey_map_evicts_oldest_offline_not_online() {
+		let mut relay = Relay::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+		let addr: SocketAddr = "203.0.113.9:1".parse().unwrap();
+		let t0 = Instant::now();
+		// One online device (its device record is live) registered first = oldest mapping.
+		let online_pk: PublicKey = [0xAA; 32];
+		let (online_id, _) = relay.register(addr, online_pk, None);
+		// Fill the map to the cap with OFFLINE mappings (device records removed), each with a
+		// later last-used time than the online one so the online one is the oldest overall.
+		while relay.by_pubkey.len() < MAX_PUBKEY_MAPPINGS {
+			let mut pk = [0u8; 32];
+			let i = relay.by_pubkey.len() as u32;
+			pk[..4].copy_from_slice(&i.to_le_bytes());
+			let (id, _) = relay.register(addr, pk, None);
+			relay.devices.remove(&id); // make it offline
+		}
+		assert_eq!(relay.by_pubkey.len(), MAX_PUBKEY_MAPPINGS);
+		// One more fresh pubkey: must evict an offline mapping (not the online one), so the
+		// map stays at the cap and the online device keeps its id.
+		let (new_id, _) = relay.register(addr, [0xBB; 32], None);
+		assert_eq!(relay.by_pubkey.len(), MAX_PUBKEY_MAPPINGS, "map stays capped");
+		assert!(
+			relay.by_pubkey.values().any(|&(v, _)| v == online_id),
+			"online device's mapping must survive eviction"
+		);
+		assert!(relay.assigned_ids.contains(&new_id));
+		let _ = t0;
 	}
 }
