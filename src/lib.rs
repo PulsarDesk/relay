@@ -399,8 +399,8 @@ impl Relay {
 		//     feedback loop that stalls the single-task event loop under churn);
 		// (2) the attacker-controlled `name` is truncated to MAX_NAME_LEN before storage so a
 		//     single entry can't pin unbounded memory;
-		// (3) `by_pubkey` is capped at MAX_PUBKEY_MAPPINGS so the 30-day PUBKEY_TTL can't let
-		//     churn pin the map for a month — when full we evict the oldest OFFLINE mapping.
+		// (3) `by_pubkey` is capped at MAX_PUBKEY_MAPPINGS: gc() amortises offline eviction
+		//     over its 10-second period (already O(n)) instead of stalling the hot path.
 		let mut rng = rand::thread_rng();
 		let now = Self::now();
 		let name = name.map(|mut n| {
@@ -423,12 +423,11 @@ impl Relay {
 				entry.0
 			}
 			None => {
-				// Bound the map: if it's full, drop the oldest OFFLINE mapping to make room
-				// (online devices keep their IDs). If every mapping is online (no abuse), we
-				// just let the map exceed the cap rather than rotate a live device's ID.
-				if self.by_pubkey.len() >= MAX_PUBKEY_MAPPINGS {
-					self.evict_oldest_offline_mapping();
-				}
+				// Bound the map: gc() proactively evicts offline mappings when the map is
+				// at or above MAX_PUBKEY_MAPPINGS (amortised O(n) every 10 s, not per-packet).
+				// Between gc cycles the map may briefly exceed the cap under a flood; that is
+				// acceptable — memory is the concern, not an exact count. Online devices
+				// keep their IDs regardless; only offline mappings are culled by gc.
 				let fresh = loop {
 					let candidate = DeviceId::random(&mut rng);
 					if !self.assigned_ids.contains(&candidate) {
@@ -452,25 +451,6 @@ impl Relay {
 			},
 		);
 		(id, token)
-	}
-
-	/// Make room in [`Self::by_pubkey`] when it has hit [`MAX_PUBKEY_MAPPINGS`]: evict the
-	/// oldest (least-recently-used) mapping whose device is NOT currently registered. Online
-	/// devices are never rotated, so a returning device keeps its stable ID; only stale
-	/// offline mappings (the bulk of a flood) are dropped. Does nothing if every mapping is
-	/// online (the map is then allowed to exceed the cap rather than disrupt a live device).
-	fn evict_oldest_offline_mapping(&mut self) {
-		let devices = &self.devices;
-		let victim = self
-			.by_pubkey
-			.iter()
-			.filter(|(_, (id, _))| !devices.contains_key(id))
-			.min_by_key(|(_, (_, last))| *last)
-			.map(|(pk, (id, _))| (*pk, *id));
-		if let Some((pk, id)) = victim {
-			self.by_pubkey.remove(&pk);
-			self.assigned_ids.remove(&id);
-		}
 	}
 
 	fn authed(&self, id: DeviceId, token: Token) -> bool {
@@ -565,6 +545,29 @@ impl Relay {
 				false
 			}
 		});
+		// If a flood has pushed by_pubkey above MAX_PUBKEY_MAPPINGS, evict the oldest
+		// OFFLINE mappings in bulk here — amortised O(n) every 10 s, not O(n) per
+		// registration on the hot path. Online devices are never rotated. We collect
+		// offline candidates (already O(n) to scan), sort by last-used, and drop the
+		// oldest until the map is back below the cap (or no offline candidates remain).
+		if self.by_pubkey.len() >= MAX_PUBKEY_MAPPINGS {
+			let devices = &self.devices;
+			let mut offline: Vec<(Instant, PublicKey, DeviceId)> = self
+				.by_pubkey
+				.iter()
+				.filter(|(_, (id, _))| !devices.contains_key(id))
+				.map(|(pk, (id, last))| (*last, *pk, *id))
+				.collect();
+			// Sort ascending by last-used (oldest first = evict first).
+			offline.sort_unstable_by_key(|(last, _, _)| *last);
+			for (_, pk, id) in offline {
+				if self.by_pubkey.len() < MAX_PUBKEY_MAPPINGS {
+					break;
+				}
+				self.by_pubkey.remove(&pk);
+				self.assigned_ids.remove(&id);
+			}
+		}
 		// Reap idle rate-limit meters so the maps don't grow unbounded.
 		self.user_meters
 			.retain(|_, m| now.saturating_duration_since(m.last_active) < METER_TTL);
@@ -777,9 +780,10 @@ mod tests {
 		assert!(relay.assigned_ids.is_empty(), "reverse index must track reaping");
 	}
 
-	// When by_pubkey hits its size cap, registering a fresh pubkey evicts the OLDEST OFFLINE
-	// mapping — never an online device's — so a flood can't grow the map without bound while
-	// live devices keep their stable IDs.
+	// When by_pubkey hits its size cap, gc() evicts the OLDEST OFFLINE mappings — never an
+	// online device's — so a flood can't grow the map without bound while live devices keep
+	// their stable IDs.  Registration itself no longer blocks on an O(n) scan; the eviction
+	// is amortised into the periodic gc() call that already iterates the map.
 	#[tokio::test]
 	async fn full_pubkey_map_evicts_oldest_offline_not_online() {
 		let mut relay = Relay::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
@@ -798,10 +802,18 @@ mod tests {
 			relay.devices.remove(&id); // make it offline
 		}
 		assert_eq!(relay.by_pubkey.len(), MAX_PUBKEY_MAPPINGS);
-		// One more fresh pubkey: must evict an offline mapping (not the online one), so the
-		// map stays at the cap and the online device keeps its id.
+		// One more fresh pubkey: the map briefly exceeds the cap until gc() runs (no O(n)
+		// eviction on the hot path).
 		let (new_id, _) = relay.register(addr, [0xBB; 32], None);
-		assert_eq!(relay.by_pubkey.len(), MAX_PUBKEY_MAPPINGS, "map stays capped");
+		assert_eq!(relay.by_pubkey.len(), MAX_PUBKEY_MAPPINGS + 1, "map grows by one before gc");
+		assert!(relay.assigned_ids.contains(&new_id));
+		// After gc() the map is trimmed back to ≤ MAX_PUBKEY_MAPPINGS. The online device's
+		// mapping must survive; only offline stale entries are culled.
+		relay.gc_at(t0 + Duration::from_secs(1));
+		assert!(
+			relay.by_pubkey.len() <= MAX_PUBKEY_MAPPINGS,
+			"gc must trim map back to cap"
+		);
 		assert!(
 			relay.by_pubkey.values().any(|&(v, _)| v == online_id),
 			"online device's mapping must survive eviction"
