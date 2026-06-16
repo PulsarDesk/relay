@@ -47,13 +47,19 @@ pub const MAX_PUBKEY_MAPPINGS: usize = 100_000;
 /// Hard upper bound on a single `RelayData` payload the relay will forward,
 /// enforced UNCONDITIONALLY — independent of the (default-off) operator bandwidth
 /// limiter. Without this the relay is a full-rate UDP reflector: any session member
-/// can have us blast arbitrarily large datagrams at the other peer. Sessions only
-/// carry the small E2E-encrypted control channel (bulk A/V goes direct UDP, never
-/// through the relay), so a generous multiple of the MTU-safe `MAX_DATAGRAM` leaves
-/// ample headroom for legitimate control payloads + crypto/framing overhead while
-/// still capping the reflection/amplification surface. Oversized datagrams are
-/// dropped (UDP — the sender's stream adapts).
-pub const MAX_RELAY_PAYLOAD: usize = 16 * MAX_DATAGRAM;
+/// can have us blast arbitrarily large datagrams at the other peer.
+///
+/// The bound must accommodate the worst-case legitimate `DataMsg`: the identity
+/// avatar (≤ `MAX_AVATAR_BYTES` = 14 000 raw bytes, defined in `src-tauri/src/avatar.rs`).
+/// `DataMsg` is serialized with `serde_json`, which encodes a `Vec<u8>` as a JSON
+/// decimal-number array — roughly 3.57–4 chars per byte for arbitrary binary data —
+/// so 14 000 raw bytes expand to ≈ 50–56 KB of JSON.  Add ChaCha20-Poly1305 seal
+/// (+16 bytes) and bincode `PeerMsg::Data` / `RelayData` framing (tens of bytes) and
+/// the sealed payload the relay sees is ≈ 57 KB at most.  64 KB gives a comfortable
+/// margin while still capping the reflection/amplification surface below a single UDP
+/// maximum (65 507 bytes).  Bulk A/V goes direct UDP, never through the relay.
+/// Oversized datagrams are dropped (UDP — the sender's stream adapts).
+pub const MAX_RELAY_PAYLOAD: usize = 64 * 1024; // 64 KB — covers JSON-expanded avatar/cursor DataMsgs
 /// Hard upper bound on the `hello` handshake blob a `ClientMsg::Connect` may carry, enforced
 /// UNCONDITIONALLY (independent of the default-off operator bandwidth limiter). The relay
 /// forwards this attacker-controllable blob verbatim inside a `RelayMsg::Incoming` to the
@@ -192,12 +198,26 @@ impl Relay {
 				// Reject an incompatible wire version up front. The per-session handshake
 				// blob format is version-specific (v2 added a 32-byte salt), so a mismatched
 				// peer otherwise registers fine and the incompatibility only surfaces later
-				// as a misleading rendezvous/handshake TIMEOUT. A typed error here lets the
-				// client show a clear "update required" message instead.
+				// as a misleading rendezvous/handshake TIMEOUT.
+				//
+				// WIRE-COMPAT: we reply with `ErrCode::Protocol` (variant index 3, present
+				// in ALL released builds) rather than `ErrCode::IncompatibleVersion` (variant
+				// index 5, only in builds that already carry the new variant). An old client
+				// that predates `IncompatibleVersion` cannot decode variant-index 5 at all —
+				// bincode returns a hard error and `handle_datagram` silently drops the entire
+				// datagram — so the "update required" path is unreachable and the old client
+				// just sees a generic REGISTER_TIMEOUT instead. `Protocol` is decodable by
+				// every existing build, so the old client at least fast-fails rather than
+				// hanging. New clients (that carry `IncompatibleVersion`) decode `Protocol`
+				// fine too and fail quickly via the `register_error` path.
+				//
+				// `IncompatibleVersion` is reserved for relay→client notifications where BOTH
+				// ends are known to be new enough to decode it (a two-phase rollout: ship the
+				// decoder first, only start emitting the code once it's universal).
 				if version != PROTOCOL_VERSION {
 					tracing::warn!(%from, version, expected = PROTOCOL_VERSION, "rejecting register: incompatible protocol version");
 					return Some((
-						Self::err(ErrCode::IncompatibleVersion, "incompatible protocol version"),
+						Self::err(ErrCode::Protocol, "incompatible protocol version"),
 						from,
 					));
 				}
@@ -256,14 +276,17 @@ impl Relay {
 						return Some((Self::err(ErrCode::Protocol, "session id in use"), from));
 					}
 				}
-				// Charge the forwarded Incoming against the operator bandwidth limits (same
-				// meter as RelayData) so Connect-spam counts toward an over-cap sender's
-				// per-device / per-source-IP budget instead of being a free reflection path.
-				// No-op when no limit is configured (the default).
+				// Rate-limit the forwarded Incoming to guard against Connect-flood abuse, but
+				// intentionally skip the cumulative VOLUME cap (use allow_signal, not allow).
+				// The volume cap is monotonic — once an IP/device's total exceeds the cap it
+				// never recovers within the meter's lifetime — so charging rendezvous signaling
+				// against it would permanently lock out new relay-fallback connections from any
+				// device behind that NAT/IP once the data budget is exhausted. Rate-only limiting
+				// still prevents reflection/amplification abuse. No-op when no limit is configured.
 				// IMPORTANT: evaluated BEFORE sessions.insert so a cap-rejected Connect
 				// does not leave a stale session record in the map (the session is never
 				// inserted, so there is nothing to clean up on the early return).
-				if !self.allow(id, from.ip(), hello.len()) {
+				if !self.allow_signal(id, from.ip(), hello.len()) {
 					return None;
 				}
 				self.sessions.insert(
@@ -316,11 +339,13 @@ impl Relay {
 				sess.last_seen = Self::now();
 				let requester_id = sess.requester;
 				let requester_addr = sess.requester_addr;
-				// Charge the forwarded PeerFound against the operator bandwidth limits so
-				// Accept-spam from an over-cap target counts toward its per-device / per-IP
-				// budget instead of being a free reflection path — mirrors the allow() call on
-				// the Connect side. No-op when no limit is configured (the default).
-				if !self.allow(id, from.ip(), answer.len()) {
+				// Rate-limit the forwarded PeerFound to guard against Accept-flood abuse, but
+				// intentionally skip the cumulative VOLUME cap (use allow_signal, not allow) —
+				// mirrors the allow_signal() call on the Connect side. See the Connect block
+				// above for the full rationale: volume-capping rendezvous signaling would
+				// permanently lock out new connections once the data budget is exhausted.
+				// No-op when no limit is configured (the default).
+				if !self.allow_signal(id, from.ip(), answer.len()) {
 					return None;
 				}
 				let _ = requester_id; // used for symmetry with Connect; may wire to metrics later
@@ -461,13 +486,40 @@ impl Relay {
 	/// operator limits. Returns false when over the rate or volume cap; the caller then
 	/// drops the datagram. No-op (always true) when no limit is configured.
 	fn allow(&mut self, id: DeviceId, ip: IpAddr, sz: usize) -> bool {
+		self.allow_inner(id, ip, sz, false)
+	}
+
+	/// Charge a connection-setup signaling message (Connect/Accept) against the operator
+	/// rate limit ONLY — intentionally skipping the cumulative volume cap.
+	///
+	/// The volume cap is a one-way monotonic counter (total never recovers). Folding
+	/// rendezvous signaling into the same budget as bulk RelayData means that once an
+	/// IP/device hits its data cap, no NEW relay-fallback connection can be established
+	/// from behind that IP — even from an entirely different device sharing a NAT. Rate
+	/// limiting still applies to prevent Connect/Accept flood abuse; only the permanent
+	/// volume lockout is avoided.
+	fn allow_signal(&mut self, id: DeviceId, ip: IpAddr, sz: usize) -> bool {
+		self.allow_inner(id, ip, sz, true)
+	}
+
+	/// Shared implementation for [`allow`] and [`allow_signal`].
+	/// When `rate_only` is true, the cumulative volume (`total`) axis is skipped so
+	/// connection-setup messages (Connect/Accept) are never permanently locked out by
+	/// the data cap.
+	fn allow_inner(&mut self, id: DeviceId, ip: IpAddr, sz: usize, rate_only: bool) -> bool {
 		if self.limits.is_unlimited() {
 			return true;
 		}
 		let now = Self::now();
 		let sz = sz as u64;
-		let (ubps, utot) = (self.limits.per_user_bps, self.limits.per_user_total);
-		let (ibps, itot) = (self.limits.per_ip_bps, self.limits.per_ip_total);
+		let (ubps, utot) = (
+			self.limits.per_user_bps,
+			if rate_only { None } else { self.limits.per_user_total },
+		);
+		let (ibps, itot) = (
+			self.limits.per_ip_bps,
+			if rate_only { None } else { self.limits.per_ip_total },
+		);
 		let user_active = ubps.is_some() || utot.is_some();
 		let ip_active = ibps.is_some() || itot.is_some();
 		// Dry-run both meters against the SAME `now` before charging either, so a reject by
