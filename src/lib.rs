@@ -221,6 +221,30 @@ impl Relay {
 						from,
 					));
 				}
+				// DoS-throttle mitigation: rate-limit Register by source IP so an attacker
+				// who knows a victim's public X25519 key (broadcast in every handshake + LAN
+				// beacon) cannot flood Register{pubkey: victim_pubkey} to overwrite the live
+				// device's addr/token and cause ID-takeover / heartbeat-flap DoS.
+				// We use allow_signal (rate-only, no permanent volume lockout) so a legitimate
+				// device that restarts and re-registers from a new IP is only throttled, not
+				// permanently blocked. For a known pubkey the real DeviceId is looked up so the
+				// per-user meter applies. For a brand-new (unknown) pubkey we use the
+				// out-of-range sentinel DeviceId(0); allow_inner skips the per-user bucket for
+				// sentinel values (0 < DeviceId::MIN), so only the per-IP axis is charged — the
+				// meaningful bound for DoS. Without this guard every first-time registration
+				// would drain the SAME DeviceId(0) user bucket, throttling all new devices
+				// relay-wide when --user-rate is set without --ip-rate.
+				// TODO: full proof-of-possession challenge/response is the complete fix — this
+				// rate-limit only raises the cost of the attack, it does not prevent it.
+				let provisional_id = self
+					.by_pubkey
+					.get(&pubkey)
+					.map(|e| e.0)
+					.unwrap_or(DeviceId(0));
+				if !self.allow_signal(provisional_id, from.ip(), datagram.len().max(MAX_DATAGRAM)) {
+					tracing::debug!(%from, "register rate-limited (DoS throttle)");
+					return None;
+				}
 				let (id, token) = self.register(from, pubkey, name);
 				tracing::info!(%id, %from, "device registered");
 				Some((encode(&RelayMsg::Registered { id, token }), from))
@@ -520,7 +544,12 @@ impl Relay {
 			self.limits.per_ip_bps,
 			if rate_only { None } else { self.limits.per_ip_total },
 		);
-		let user_active = ubps.is_some() || utot.is_some();
+		// Only engage the per-user meter for a validated DeviceId (id.0 >= DeviceId::MIN).
+		// The Register path uses the out-of-range sentinel DeviceId(0) for brand-new pubkeys,
+		// and allowing it into the user-meter would make ALL fresh registrations share one
+		// token bucket — throttling an entire kiosk/appliance fleet's first-boot registrations
+		// whenever --user-rate is configured without --ip-rate.
+		let user_active = (ubps.is_some() || utot.is_some()) && id.0 >= pulsar_proto::DeviceId::MIN;
 		let ip_active = ibps.is_some() || itot.is_some();
 		// Dry-run both meters against the SAME `now` before charging either, so a reject by
 		// one meter never consumes rate-bucket tokens / volume from the other. (Charging the
@@ -872,5 +901,94 @@ mod tests {
 		);
 		assert!(relay.assigned_ids.contains(&new_id));
 		let _ = t0;
+	}
+
+	// Register rate-limit is no longer a no-op: flooding Register from one IP eventually
+	// causes handle() to return None (dropped), while a single Register from a fresh IP
+	// with an identical pubkey still succeeds.  Verifies the bug-fix for the hard-coded
+	// `0` charge in allow_signal that made the throttle permanently bypass-able.
+	#[tokio::test]
+	async fn register_rate_limit_throttles_flood_from_single_ip() {
+		// per_ip_bps = MAX_DATAGRAM (1400 B/s): the token bucket starts full at 1 second of
+		// rate = 1400 tokens, so the FIRST Register (charged 1400 B) passes; every subsequent
+		// one at the same instant is dropped because the bucket is empty.
+		let limits = Limits {
+			per_ip_bps: Some(MAX_DATAGRAM as u64),
+			..Limits::default()
+		};
+		let mut relay = Relay::bind("127.0.0.1:0".parse().unwrap())
+			.await
+			.unwrap()
+			.with_limits(limits);
+
+		let flooder_ip: SocketAddr = "203.0.113.1:1234".parse().unwrap();
+		let victim_ip: SocketAddr = "203.0.113.2:5678".parse().unwrap();
+
+		// Build a valid Register datagram (version + fresh pubkey).
+		let make_register = |pk: PublicKey| {
+			encode(&ClientMsg::Register {
+				version: PROTOCOL_VERSION,
+				pubkey: pk,
+				name: None,
+			})
+		};
+
+		// First Register from the flooder's IP — should pass (bucket full).
+		let first = relay.handle(&make_register([0xAA; 32]), flooder_ip);
+		assert!(first.is_some(), "first Register must pass (bucket full)");
+
+		// Subsequent Registers from the SAME IP at the same instant — must be dropped.
+		let mut any_dropped = false;
+		for i in 0..10u8 {
+			let mut pk = [0u8; 32];
+			pk[0] = i.wrapping_add(1);
+			if relay.handle(&make_register(pk), flooder_ip).is_none() {
+				any_dropped = true;
+				break;
+			}
+		}
+		assert!(any_dropped, "flood from one IP must be rate-limited (handle returns None)");
+
+		// A single Register from a DIFFERENT IP must still succeed — the per-IP meter is
+		// independent; the flood from another address must not lock out this one.
+		let legit = relay.handle(&make_register([0xFF; 32]), victim_ip);
+		assert!(legit.is_some(), "Register from a fresh IP must not be blocked by another IP's flood");
+	}
+
+	// When ONLY per_user_bps is set (no per_ip_bps), two brand-new pubkeys from DIFFERENT
+	// IPs must both succeed at the same instant. Before the fix, both hits the SAME
+	// DeviceId(0) shared user bucket, so the second registration was incorrectly throttled.
+	#[tokio::test]
+	async fn register_fresh_pubkeys_from_different_ips_not_throttled_by_user_meter() {
+		// per_user_bps = MAX_DATAGRAM (1400 B/s): the token bucket starts full at exactly
+		// one Register's worth of tokens. If the sentinel DeviceId(0) were shared across
+		// all fresh registrations the FIRST one would drain the bucket and the SECOND would
+		// be dropped — even from a completely different IP. The fix skips the user meter for
+		// the out-of-range sentinel so both must succeed.
+		let limits = Limits {
+			per_user_bps: Some(MAX_DATAGRAM as u64),
+			..Limits::default()
+		};
+		let mut relay = Relay::bind("127.0.0.1:0".parse().unwrap())
+			.await
+			.unwrap()
+			.with_limits(limits);
+
+		let ip_a: SocketAddr = "203.0.113.10:1000".parse().unwrap();
+		let ip_b: SocketAddr = "203.0.113.11:2000".parse().unwrap();
+
+		let make_register = |pk: PublicKey| {
+			encode(&ClientMsg::Register {
+				version: PROTOCOL_VERSION,
+				pubkey: pk,
+				name: None,
+			})
+		};
+
+		// Two brand-new (unknown) pubkeys each from a distinct IP — both must be accepted.
+		let r1 = relay.handle(&make_register([0xA1; 32]), ip_a);
+		let r2 = relay.handle(&make_register([0xB2; 32]), ip_b);
+		assert!(r1.is_some(), "first fresh-pubkey Register must succeed under user-only rate limit");
+		assert!(r2.is_some(), "second fresh-pubkey Register from different IP must also succeed (sentinel must not share user bucket)");
 	}
 }
