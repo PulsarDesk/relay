@@ -30,21 +30,31 @@ PULSAR_RELAY_BIND=127.0.0.1:21116 cargo run -p pulsar-relay
 
 ### Bandwidth limits (operator, optional — default unlimited)
 
-Cap the **relayed** traffic (the `RelayData` the server forwards) by **device** and/or
-by **source IP**, on two axes — forward **rate** (bytes/s) and cumulative data **volume**
-(bytes). Every limit is off by default (unlimited). Over-limit datagrams are silently
-dropped (UDP — the stream adapts). Flags (each also an env var):
+Cap the **relayed** traffic (the `RelayData` the server forwards) by **device**, by
+**source IP**, and/or **per relay session**, on two axes — forward **rate** (bytes/s) and
+cumulative data **volume** (bytes). Every limit is off by default (unlimited). Over-limit
+datagrams are silently dropped (UDP — the stream adapts). Flags (each also an env var):
 
 ```bash
-pulsar-relay --user-rate 10mbit --user-data 5gb   # per-device: 10 Mbit/s, 5 GB total
-pulsar-relay --ip-rate 50mbit  --ip-data 20gb     # per-source-IP caps
+pulsar-relay --user-rate 10mbit --user-data 5gb     # per-device: 10 Mbit/s, 5 GB total
+pulsar-relay --ip-rate 50mbit  --ip-data 20gb       # per-source-IP caps
+pulsar-relay --session-rate 10mbit --session-data 2gb  # per-SESSION caps (see below)
 PULSAR_RELAY_USER_RATE=10mbit PULSAR_RELAY_USER_DATA=5gb pulsar-relay
 ```
+
+**Per-session vs per-device:** `--user-rate`/`--ip-rate` are SHARED across all of a device's
+(or IP's) traffic — two split-screen panes from one device contend for one bucket. `--session-rate`
+caps **each relay session independently**, so each stream gets the full budget. It also doubles
+as an **encoder hint**: the relay advertises the per-session rate to the connecting client
+(`PeerFound.rate_cap_kbps`, protocol v3), so a relayed client **starts its encoder at/below the
+cap** instead of blasting its full target into the throttled pipe and waiting ~20 s for the
+loss-driven ABR to ramp down. So prefer `--session-rate` when the goal is smooth per-stream
+quality on a metered relay; use `--user-rate`/`--ip-rate` for abuse/DoS volume limits.
 
 Units: rates accept bit (`mbit`/`gbit`/`mbps`, bare `m`/`g` = bits) or byte (`mb`/`gb`,
 `mbyte`) suffixes; sizes accept `mb`/`gb`/`tb` (1000-based) or `mib`/`gib` (1024-based).
 **The same flags/env work for the desktop app's relay mode** (`pulsar --relay
---user-rate 10mbit …`) — both run the same `Relay` (`pulsar_relay::Limits`).
+--session-rate 10mbit …`) — both run the same `Relay` (`pulsar_relay::Limits`).
 
 It's a single self-contained binary — easy to self-host (the website shows a
 `docker run … pulsar/relay` flow). The desktop app's relay endpoint is

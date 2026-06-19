@@ -112,6 +112,10 @@ pub struct Relay {
 	/// Per-device + per-IP rate/volume meters (only populated when a limit is set).
 	user_meters: HashMap<DeviceId, Meter>,
 	ip_meters: HashMap<IpAddr, Meter>,
+	/// Per-SESSION rate/volume meters (only when `per_session_*` is set). Keyed by the
+	/// relay SessionId so each session is metered independently of the device's other
+	/// sessions. Reaped by gc() like the other meter maps.
+	session_meters: HashMap<SessionId, Meter>,
 }
 
 impl Relay {
@@ -127,6 +131,7 @@ impl Relay {
 			limits: Limits::default(),
 			user_meters: HashMap::new(),
 			ip_meters: HashMap::new(),
+			session_meters: HashMap::new(),
 		})
 	}
 
@@ -373,13 +378,16 @@ impl Relay {
 					return None;
 				}
 				let _ = requester_id; // used for symmetry with Connect; may wire to metrics later
-				// Tell the requester the target accepted, with the target's address.
+				// Tell the requester the target accepted, with the target's address — and
+				// advertise the per-session forwarding cap so a relayed client starts its
+				// encoder within the pipe (0 = uncapped).
 				Some((
 					encode(&RelayMsg::PeerFound {
 						target: id,
 						target_addr: from,
 						session,
 						answer,
+						rate_cap_kbps: self.session_cap_kbps(),
 					}),
 					requester_addr,
 				))
@@ -417,8 +425,8 @@ impl Relay {
 					}
 				};
 				// Operator bandwidth limits: silently drop (don't forward) when the
-				// sending device / source IP is over its rate or volume cap.
-				if !self.allow(id, from.ip(), payload.len()) {
+				// sending device / source IP / SESSION is over its rate or volume cap.
+				if !self.allow(id, from.ip(), session, payload.len()) {
 					return None;
 				}
 				Some((encode(&RelayMsg::RelayData { session, payload }), dest))
@@ -506,11 +514,22 @@ impl Relay {
 		self.devices.get(&id).is_some_and(|d| d.token.ct_eq(&token))
 	}
 
-	/// Charge a `sz`-byte relayed datagram (from device `id` / source `ip`) against the
-	/// operator limits. Returns false when over the rate or volume cap; the caller then
-	/// drops the datagram. No-op (always true) when no limit is configured.
-	fn allow(&mut self, id: DeviceId, ip: IpAddr, sz: usize) -> bool {
-		self.allow_inner(id, ip, sz, false)
+	/// Charge a `sz`-byte relayed datagram (from device `id` / source `ip`, on relay
+	/// `session`) against the operator limits. Returns false when over the rate or volume
+	/// cap; the caller then drops the datagram. No-op (always true) when no limit is set.
+	fn allow(&mut self, id: DeviceId, ip: IpAddr, session: SessionId, sz: usize) -> bool {
+		self.allow_inner(id, ip, sz, false, Some(session))
+	}
+
+	/// The per-session forwarding rate cap advertised to a relayed client in
+	/// `PeerFound.rate_cap_kbps`, in **kbit/s** (`0` = no per-session cap configured). Only
+	/// the dedicated per-session axis is signaled — the per-device/per-IP caps are shared
+	/// across a device's traffic, so they don't map cleanly to one session's bitrate.
+	fn session_cap_kbps(&self) -> u32 {
+		match self.limits.per_session_bps {
+			Some(bps) => ((bps.saturating_mul(8)) / 1000).min(u32::MAX as u64) as u32,
+			None => 0,
+		}
 	}
 
 	/// Charge a connection-setup signaling message (Connect/Accept) against the operator
@@ -523,14 +542,24 @@ impl Relay {
 	/// limiting still applies to prevent Connect/Accept flood abuse; only the permanent
 	/// volume lockout is avoided.
 	fn allow_signal(&mut self, id: DeviceId, ip: IpAddr, sz: usize) -> bool {
-		self.allow_inner(id, ip, sz, true)
+		// Rendezvous signaling isn't bound to an established session's data budget (the
+		// session may not exist yet), so the per-session axis doesn't apply here.
+		self.allow_inner(id, ip, sz, true, None)
 	}
 
 	/// Shared implementation for [`allow`] and [`allow_signal`].
 	/// When `rate_only` is true, the cumulative volume (`total`) axis is skipped so
 	/// connection-setup messages (Connect/Accept) are never permanently locked out by
-	/// the data cap.
-	fn allow_inner(&mut self, id: DeviceId, ip: IpAddr, sz: usize, rate_only: bool) -> bool {
+	/// the data cap. `session` (Some only on the RelayData hot path) engages the
+	/// per-session meter alongside the per-device/per-IP axes.
+	fn allow_inner(
+		&mut self,
+		id: DeviceId,
+		ip: IpAddr,
+		sz: usize,
+		rate_only: bool,
+		session: Option<SessionId>,
+	) -> bool {
 		if self.limits.is_unlimited() {
 			return true;
 		}
@@ -544,6 +573,12 @@ impl Relay {
 			self.limits.per_ip_bps,
 			if rate_only { None } else { self.limits.per_ip_total },
 		);
+		let (sbps, stot) = (
+			self.limits.per_session_bps,
+			if rate_only { None } else { self.limits.per_session_total },
+		);
+		// The per-session axis engages only on the RelayData hot path (a real SessionId).
+		let session_active = (sbps.is_some() || stot.is_some()) && session.is_some();
 		// Only engage the per-user meter for a validated DeviceId (id.0 >= DeviceId::MIN).
 		// The Register path uses the out-of-range sentinel DeviceId(0) for brand-new pubkeys,
 		// and allowing it into the user-meter would make ALL fresh registrations share one
@@ -575,12 +610,26 @@ impl Relay {
 				return false;
 			}
 		}
-		// Both approved → commit. The same `now` makes each refill an identical no-op delta.
+		if session_active {
+			let s = session.unwrap();
+			let m = self.session_meters.entry(s).or_insert_with(|| Meter::new(now));
+			m.last_active = now;
+			if !m.would_allow(now, sz, sbps, stot) {
+				return false;
+			}
+		}
+		// All approved → commit. The same `now` makes each refill an identical no-op delta.
 		if user_active {
 			self.user_meters
 				.get_mut(&id)
 				.unwrap()
 				.charge(now, sz, ubps, utot);
+		}
+		if session_active {
+			self.session_meters
+				.get_mut(&session.unwrap())
+				.unwrap()
+				.charge(now, sz, sbps, stot);
 		}
 		if ip_active {
 			self.ip_meters
@@ -653,6 +702,8 @@ impl Relay {
 		self.user_meters
 			.retain(|_, m| now.saturating_duration_since(m.last_active) < METER_TTL);
 		self.ip_meters
+			.retain(|_, m| now.saturating_duration_since(m.last_active) < METER_TTL);
+		self.session_meters
 			.retain(|_, m| now.saturating_duration_since(m.last_active) < METER_TTL);
 	}
 }

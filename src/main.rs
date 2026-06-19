@@ -36,6 +36,16 @@ struct Args {
 	/// Per-source-IP cumulative data cap, e.g. `20gb`. Default: unlimited.
 	#[arg(long, env = "PULSAR_RELAY_IP_DATA")]
 	ip_data: Option<String>,
+
+	/// Per-SESSION forward-rate cap, e.g. `10mbit`. Unlike `--user-rate`, this caps each
+	/// relay session independently (two panes from one device each get the full budget), and
+	/// is advertised to the client so its encoder starts within the cap. Default: unlimited.
+	#[arg(long, env = "PULSAR_RELAY_SESSION_RATE")]
+	session_rate: Option<String>,
+
+	/// Per-session cumulative data cap, e.g. `2gb`. Default: unlimited.
+	#[arg(long, env = "PULSAR_RELAY_SESSION_DATA")]
+	session_data: Option<String>,
 }
 
 fn opt_rate(v: &Option<String>, what: &str) -> anyhow::Result<Option<u64>> {
@@ -79,6 +89,8 @@ async fn main() -> anyhow::Result<()> {
 		per_user_total: opt_size(&args.user_data, "--user-data")?,
 		per_ip_bps: opt_rate(&args.ip_rate, "--ip-rate")?,
 		per_ip_total: opt_size(&args.ip_data, "--ip-data")?,
+		per_session_bps: opt_rate(&args.session_rate, "--session-rate")?,
+		per_session_total: opt_size(&args.session_data, "--session-data")?,
 	};
 	let relay = Relay::bind(addr).await?.with_limits(limits);
 	tracing::info!(%addr, ?limits, "pulsar-relay listening (UDP)");

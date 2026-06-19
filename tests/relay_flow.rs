@@ -201,6 +201,7 @@ async fn full_rendezvous_and_relay_forwarding() {
 			target_addr,
 			session: s,
 			answer,
+			..
 		} => {
 			assert_eq!(target, id_b);
 			assert_eq!(target_addr, b_addr);

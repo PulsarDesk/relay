@@ -25,6 +25,15 @@ pub struct Limits {
 	pub per_ip_bps: Option<u64>,
 	/// Max cumulative forwarded volume per source IP, bytes.
 	pub per_ip_total: Option<u64>,
+	/// Max forward rate per **relay SESSION**, bytes/second. Unlike the per-device/per-IP
+	/// axes (which a multi-session device shares across all its traffic), this caps EACH
+	/// session independently — so two split-screen panes from one device each get the full
+	/// budget, and the cap maps cleanly to one stream's bitrate. It also doubles as the
+	/// **encoder hint** the relay advertises in `PeerFound.rate_cap_kbps`, letting a relayed
+	/// client start at/below the cap instead of overshooting (see `session_cap_kbps`).
+	pub per_session_bps: Option<u64>,
+	/// Max cumulative forwarded volume per relay session, bytes.
+	pub per_session_total: Option<u64>,
 }
 
 impl Limits {
@@ -34,6 +43,8 @@ impl Limits {
 			&& self.per_user_total.is_none()
 			&& self.per_ip_bps.is_none()
 			&& self.per_ip_total.is_none()
+			&& self.per_session_bps.is_none()
+			&& self.per_session_total.is_none()
 	}
 }
 
