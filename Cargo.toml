@@ -1,3 +1,28 @@
+# Pulsar relay / rendezvous server — standalone crate.
+#
+# Extracted from the Pulsar monorepo. Depends on the shared wire protocol
+# (PulsarDesk/pulsar-proto) as a git dependency. This file is both the
+# workspace root and the package so `*.workspace = true` inheritance works.
+[workspace]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0-dev.27"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["Pulsar contributors"]
+rust-version = "1.85"
+
+[workspace.dependencies]
+pulsar-proto = { git = "https://github.com/PulsarDesk/pulsar-proto" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "sync"] }
+socket2 = { version = "0.5", features = ["all"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+bincode = "1.3"
+
 [package]
 name = "pulsar-relay"
 version.workspace = true
@@ -23,8 +48,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 rand.workspace = true
 # A9: socket2 lets us enlarge SO_RCVBUF/SO_SNDBUF before bind. B6: bincode's
-# serialize_into avoids a per-datagram heap alloc on the forward path. Both are
-# already in the workspace (and Cargo.lock), so this only widens this crate's view.
+# serialize_into avoids a per-datagram heap alloc on the forward path.
 socket2.workspace = true
 bincode.workspace = true
 # B12: ahash for the hot maps — faster than SipHash but still randomly-seeded, so it
