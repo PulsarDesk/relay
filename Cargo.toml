@@ -22,4 +22,12 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 rand.workspace = true
+# A9: socket2 lets us enlarge SO_RCVBUF/SO_SNDBUF before bind. B6: bincode's
+# serialize_into avoids a per-datagram heap alloc on the forward path. Both are
+# already in the workspace (and Cargo.lock), so this only widens this crate's view.
+socket2.workspace = true
+bincode.workspace = true
+# B12: ahash for the hot maps — faster than SipHash but still randomly-seeded, so it
+# keeps DoS-resistance against attacker-chosen SessionId (unlike a deterministic FxHash).
+ahash = "0.8"
 clap = { version = "4", features = ["derive", "env"] }

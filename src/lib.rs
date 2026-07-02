@@ -10,8 +10,13 @@
 //!
 //! The server is a single-task UDP event loop, so its state needs no locking.
 
-use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
+
+// B12: ahash for the hot registry/meter maps. AHashMap/AHashSet are randomly seeded
+// per process, so they stay DoS-resistant against an attacker who picks colliding
+// SessionIds (the reason we do NOT use a deterministic FxHash here) while being
+// faster than the std SipHash default on this single-task hot path.
+use ahash::{AHashMap, AHashSet};
 
 use pulsar_proto::{
 	decode, encode, ClientMsg, DeviceId, ErrCode, PublicKey, RelayMsg, SessionId, Token,
@@ -57,8 +62,11 @@ pub const MAX_PUBKEY_MAPPINGS: usize = 100_000;
 /// (+16 bytes) and bincode `PeerMsg::Data` / `RelayData` framing (tens of bytes) and
 /// the sealed payload the relay sees is ≈ 57 KB at most.  64 KB gives a comfortable
 /// margin while still capping the reflection/amplification surface below a single UDP
-/// maximum (65 507 bytes).  Bulk A/V goes direct UDP, never through the relay.
-/// Oversized datagrams are dropped (UDP — the sender's stream adapts).
+/// maximum (65 507 bytes).  On the relay-fallback path the encrypted A/V stream IS
+/// forwarded through the relay too (as `RelayData` — which is why the per-session rate
+/// cap / encoder hint exists), but it is sent in MTU-sized datagrams that stay far below
+/// this cap; the bound is therefore driven by the largest single control `DataMsg` (the
+/// avatar), not by media.  Oversized datagrams are dropped (UDP — the sender's stream adapts).
 pub const MAX_RELAY_PAYLOAD: usize = 64 * 1024; // 64 KB — covers JSON-expanded avatar/cursor DataMsgs
 /// Hard upper bound on the `hello` handshake blob a `ClientMsg::Connect` may carry, enforced
 /// UNCONDITIONALLY (independent of the default-off operator bandwidth limiter). The relay
@@ -94,44 +102,71 @@ struct Session {
 /// The relay server. Build with [`Relay::bind`], then drive with [`Relay::run`].
 pub struct Relay {
 	sock: UdpSocket,
-	devices: HashMap<DeviceId, Device>,
-	sessions: HashMap<SessionId, Session>,
+	// B12: ahash-backed maps below (AHashMap/AHashSet) — randomly seeded so an attacker
+	// can't grief us with colliding keys, but faster than std SipHash on the hot path.
+	devices: AHashMap<DeviceId, Device>,
+	sessions: AHashMap<SessionId, Session>,
 	/// Stable mapping pubkey → (id, last-used) so a returning device keeps the SAME
 	/// 9-digit ID across reconnects/restarts (the client persists its identity).
 	/// Survives the device's TTL eviction; gc() refreshes entries of registered
 	/// devices and reaps mappings offline past [`PUBKEY_TTL`].
-	by_pubkey: HashMap<PublicKey, (DeviceId, Instant)>,
+	by_pubkey: AHashMap<PublicKey, (DeviceId, Instant)>,
 	/// Reverse index of every id currently held in [`Self::by_pubkey`], kept exactly in
 	/// sync with its value set. Lets id minting test a candidate for collision in O(1)
 	/// instead of an O(n) scan of `by_pubkey` — without it a Register flood makes each new
 	/// registration cost more CPU as the map grows (a super-linear feedback loop that, on a
 	/// single-task event loop, stalls all clients).
-	assigned_ids: HashSet<DeviceId>,
+	assigned_ids: AHashSet<DeviceId>,
 	/// Operator bandwidth limits (default: unlimited — see [`Limits`]).
 	limits: Limits,
 	/// Per-device + per-IP rate/volume meters (only populated when a limit is set).
-	user_meters: HashMap<DeviceId, Meter>,
-	ip_meters: HashMap<IpAddr, Meter>,
+	user_meters: AHashMap<DeviceId, Meter>,
+	ip_meters: AHashMap<IpAddr, Meter>,
 	/// Per-SESSION rate/volume meters (only when `per_session_*` is set). Keyed by the
 	/// relay SessionId so each session is metered independently of the device's other
 	/// sessions. Reaped by gc() like the other meter maps.
-	session_meters: HashMap<SessionId, Meter>,
+	session_meters: AHashMap<SessionId, Meter>,
+	/// B6: reusable serialization buffer for the RelayData forward path, so the hottest
+	/// path doesn't heap-allocate a fresh Vec per forwarded datagram. Only ever touched by
+	/// the single-task event loop, so it needs no locking.
+	scratch: Vec<u8>,
 }
 
 impl Relay {
 	/// Bind the relay's UDP socket. Pass `127.0.0.1:0` in tests to get an ephemeral port.
 	pub async fn bind(addr: SocketAddr) -> std::io::Result<Self> {
-		let sock = UdpSocket::bind(addr).await?;
+		// A9: build the UDP socket via socket2 so we can enlarge the kernel buffers BEFORE
+		// bind. The default SO_RCVBUF (~208 KB on Linux) overflows under a burst across many
+		// sessions or a brief scheduling hiccup and silently drops relayed datagrams; a roomy
+		// recv buffer (plus a smaller send buffer) absorbs those bursts. The kernel clamps the
+		// request to net.core.rmem_max/wmem_max, so we log the size we actually got. The
+		// buffer-size sets are best-effort (a platform may reject the exact value) — only
+		// socket creation / nonblocking / bind failures are fatal.
+		let sock2 = socket2::Socket::new(
+			socket2::Domain::for_address(addr),
+			socket2::Type::DGRAM,
+			Some(socket2::Protocol::UDP),
+		)?;
+		let _ = sock2.set_recv_buffer_size(8 << 20); // request 8 MiB recv buffer
+		let _ = sock2.set_send_buffer_size(4 << 20); // request 4 MiB send buffer
+		sock2.set_nonblocking(true)?; // tokio's UdpSocket::from_std requires non-blocking
+		sock2.bind(&addr.into())?;
+		match sock2.recv_buffer_size() {
+			Ok(sz) => tracing::info!(%addr, recv_buf = sz, "relay UDP socket bound"),
+			Err(e) => tracing::warn!(%addr, "relay UDP socket bound (recv_buffer_size query failed: {e})"),
+		}
+		let sock = UdpSocket::from_std(std::net::UdpSocket::from(sock2))?;
 		Ok(Self {
 			sock,
-			devices: HashMap::new(),
-			sessions: HashMap::new(),
-			by_pubkey: HashMap::new(),
-			assigned_ids: HashSet::new(),
+			devices: AHashMap::new(),
+			sessions: AHashMap::new(),
+			by_pubkey: AHashMap::new(),
+			assigned_ids: AHashSet::new(),
 			limits: Limits::default(),
-			user_meters: HashMap::new(),
-			ip_meters: HashMap::new(),
-			session_meters: HashMap::new(),
+			user_meters: AHashMap::new(),
+			ip_meters: AHashMap::new(),
+			session_meters: AHashMap::new(),
+			scratch: Vec::new(),
 		})
 	}
 
@@ -150,7 +185,12 @@ impl Relay {
 	/// Run the event loop forever (until the socket errors).
 	pub async fn run(mut self) -> std::io::Result<()> {
 		let mut buf = vec![0u8; 65_536];
-		let mut gc = tokio::time::interval(Duration::from_secs(10));
+		// A20: split the GC into two cadences. Devices/sessions expire on a tight 10s tick
+		// (keeps the TTLs honest), but the O(by_pubkey) stable-ID scan + map-cap eviction +
+		// meter reaping — which walk potentially-large maps — run on a slower 60s tick so that
+		// O(n) sweep can't stall datagram forwarding on this single-task event loop.
+		let mut gc_fast = tokio::time::interval(Duration::from_secs(10));
+		let mut gc_slow = tokio::time::interval(Duration::from_secs(60));
 		loop {
 			tokio::select! {
 				res = self.sock.recv_from(&mut buf) => {
@@ -169,10 +209,25 @@ impl Relay {
 					};
 					// One malformed datagram must never take the relay down.
 					if let Some((bytes, to)) = self.handle(&buf[..n], from) {
-						let _ = self.sock.send_to(&bytes, to).await;
+						// The replies returned here are the rare ONE-SHOT control/rendezvous
+						// datagrams (Registered / HeartbeatAck / Incoming / PeerFound / Error) —
+						// tiny, infrequent, and NOT recoverable by stream adaptation or any
+						// retransmission: the relay never resends them and connect()/register()
+						// just time out (3s → TargetUnreachable / register failure). So unlike
+						// the RelayData hot path — which uses non-blocking try_send_to inline in
+						// handle() (see B6) precisely so a slow peer can't head-of-line block
+						// recv_from, and where a WouldBlock drop is just UDP loss the stream
+						// adapts to — deliver these with an awaited send_to. tokio awaits socket
+						// writability, so a transient full SO_SNDBUF under heavy RelayData load
+						// can't silently drop an unrelated peer's connection setup; awaiting a
+						// handful of small control datagrams can't meaningfully stall the loop.
+						if let Err(e) = self.sock.send_to(&bytes, to).await {
+							tracing::debug!(%to, error = %e, "relay: control reply send failed");
+						}
 					}
 				}
-				_ = gc.tick() => self.gc(),
+				_ = gc_fast.tick() => self.gc_devices_sessions(Self::now()),
+				_ = gc_slow.tick() => self.gc(),
 			}
 		}
 	}
@@ -290,7 +345,9 @@ impl Relay {
 					dev.addr = from;
 					dev.last_seen = Self::now();
 				}
+				tracing::info!(requester = %id, %target, "relay: Connect request received");
 				let Some(tdev) = self.devices.get(&target).cloned() else {
+					tracing::warn!(%target, "relay: Connect target NOT online");
 					return Some((Self::err(ErrCode::TargetOffline, "target not online"), from));
 				};
 				// Session ownership: a SessionId is bound to the device that first created
@@ -328,6 +385,7 @@ impl Relay {
 						last_seen: Self::now(),
 					},
 				);
+				tracing::info!(%target, target_addr = %tdev.addr, "relay: forwarding Incoming to target");
 				// Notify the target so it can start hole-punching toward the requester.
 				Some((
 					encode(&RelayMsg::Incoming {
@@ -404,8 +462,10 @@ impl Relay {
 				}
 				// Hard payload cap, enforced regardless of operator bandwidth limits (which
 				// are off by default): drop oversized datagrams so the relay can't be used as
-				// a full-rate UDP reflector/amplifier toward a session peer. Sessions carry
-				// only the small control channel — anything this large is abuse or a bug.
+				// a full-rate UDP reflector/amplifier toward a session peer. Even the relayed
+				// A/V path sends MTU-sized datagrams (the largest legitimate one is a control
+				// DataMsg — the avatar; see MAX_RELAY_PAYLOAD), so anything this large is abuse
+				// or a bug.
 				if payload.len() > MAX_RELAY_PAYLOAD {
 					return None;
 				}
@@ -429,7 +489,18 @@ impl Relay {
 				if !self.allow(id, from.ip(), session, payload.len()) {
 					return None;
 				}
-				Some((encode(&RelayMsg::RelayData { session, payload }), dest))
+				// B6: forward the hottest path WITHOUT a fresh per-datagram heap allocation.
+				// `encode()` (used by the rare control replies above) allocates a new Vec on
+				// every call; here we serialize the RelayData frame into the reusable scratch
+				// buffer and send it inline (the "multi-send cases send inline" path noted on
+				// `handle`), so a busy relay doesn't churn one allocation per forwarded datagram.
+				// A6: try_send_to so a backpressured peer can't head-of-line block recv for the
+				// other sessions (a full send buffer drops this datagram like any UDP loss).
+				self.scratch.clear();
+				bincode::serialize_into(&mut self.scratch, &RelayMsg::RelayData { session, payload })
+					.expect("protocol messages are always serializable");
+				let _ = self.sock.try_send_to(&self.scratch, dest);
+				None
 			}
 
 			ClientMsg::Bye { id, token } => {
@@ -647,17 +718,26 @@ impl Relay {
 		})
 	}
 
-	/// Drop stale devices and sessions.
+	/// The full periodic sweep (run on the slower 60s cadence in [`Self::run`]): expire
+	/// stale devices/sessions AND do the heavier O(by_pubkey) scan + meter reaping.
 	fn gc(&mut self) {
 		self.gc_at(Self::now());
 	}
 
-	/// [`Self::gc`] against an explicit `now`, so tests can drive long horizons.
-	fn gc_at(&mut self, now: Instant) {
+	/// A20: the cheap half of GC, run on the tight 10s cadence — expire stale devices and
+	/// sessions only. Kept separate from the O(by_pubkey) scan + meter reaping (which run on
+	/// the slower 60s cadence via [`Self::gc`]) so that O(n) sweep never stalls forwarding.
+	fn gc_devices_sessions(&mut self, now: Instant) {
 		self.devices
 			.retain(|_, d| now.duration_since(d.last_seen) < DEVICE_TTL);
 		self.sessions
 			.retain(|_, s| now.duration_since(s.last_seen) < SESSION_TTL);
+	}
+
+	/// [`Self::gc`] against an explicit `now`, so tests can drive long horizons. Performs the
+	/// FULL sweep (cheap device/session expiry + the heavier stable-ID/meter maintenance).
+	fn gc_at(&mut self, now: Instant) {
+		self.gc_devices_sessions(now);
 		// The stable-ID map: keep refreshing entries whose device is still registered
 		// (a host online for months must not lose its mapping), and reap entries that
 		// have been offline past PUBKEY_TTL so the map stays bounded under churn. Keep the
