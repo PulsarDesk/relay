@@ -1,0 +1,121 @@
+name: Release
+
+# Cut from `main`. semantic-release computes the next version from Conventional
+# Commits and creates a git TAG + GitHub Release ONLY — it never commits back to
+# the repo (no @semantic-release/git plugin). Cross-platform relay binaries are
+# built and attached to that release.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # 1. Test gate + compute the next version (dry-run: no tag/release created yet).
+  prepare:
+    name: Prepare (version + test gate)
+    runs-on: ubuntu-22.04
+    outputs:
+      published: ${{ steps.semrel.outputs.new_release_published }}
+      version: ${{ steps.semrel.outputs.new_release_version }}
+      tag: ${{ steps.semrel.outputs.new_release_git_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test gate (no version/build/release if these fail)
+        run: cargo test --locked
+      - name: Compute next version (dry-run — creates NO tag or release)
+        id: semrel
+        uses: cycjimmy/semantic-release-action@v4
+        with:
+          dry_run: true
+          extra_plugins: |
+            conventional-changelog-conventionalcommits@^9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # 2. Build the standalone relay binary per platform (only if a release is due).
+  build:
+    name: Relay · ${{ matrix.name }}
+    needs: prepare
+    if: needs.prepare.outputs.published == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04,     name: linux-x64,   ext: '', target: '' }
+          - { os: ubuntu-22.04-arm, name: linux-arm64, ext: '', target: '' }
+          - { os: windows-latest,   name: windows-x64, ext: '.exe', target: '' }
+          - { os: macos-latest,     name: macos-arm64, ext: '', target: '' }
+          - { os: macos-latest,     name: macos-x64,   ext: '', target: 'x86_64-apple-darwin' }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: relay-${{ matrix.name }}
+      - name: Build relay (release)
+        shell: bash
+        run: |
+          mkdir -p release-artifacts
+          if [ -n "${{ matrix.target }}" ]; then
+            cargo build --release --locked --target "${{ matrix.target }}"
+            BIN="target/${{ matrix.target }}/release/pulsar-relay${{ matrix.ext }}"
+          else
+            cargo build --release --locked
+            BIN="target/release/pulsar-relay${{ matrix.ext }}"
+          fi
+          cp "$BIN" "release-artifacts/pulsar-relay-${{ matrix.name }}${{ matrix.ext }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: relay-${{ matrix.name }}
+          path: release-artifacts/*
+          if-no-files-found: error
+
+  # 3. Everything built → create the tag + GitHub release, attach the binaries.
+  publish:
+    name: Publish release
+    needs: [prepare, build]
+    if: needs.prepare.outputs.published == 'true'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Semantic Release (create tag + GitHub release, no commit)
+        id: semrel
+        uses: cycjimmy/semantic-release-action@v4
+        with:
+          extra_plugins: |
+            conventional-changelog-conventionalcommits@^9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Attach relay binaries to the release
+        if: steps.semrel.outputs.new_release_published == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          mapfile -t files < <(find artifacts -type f)
+          printf '%s\n' "${files[@]}"
+          gh release upload "${{ steps.semrel.outputs.new_release_git_tag }}" "${files[@]}" --clobber

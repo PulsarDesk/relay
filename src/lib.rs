@@ -153,7 +153,9 @@ impl Relay {
 		sock2.bind(&addr.into())?;
 		match sock2.recv_buffer_size() {
 			Ok(sz) => tracing::info!(%addr, recv_buf = sz, "relay UDP socket bound"),
-			Err(e) => tracing::warn!(%addr, "relay UDP socket bound (recv_buffer_size query failed: {e})"),
+			Err(e) => {
+				tracing::warn!(%addr, "relay UDP socket bound (recv_buffer_size query failed: {e})")
+			}
 		}
 		let sock = UdpSocket::from_std(std::net::UdpSocket::from(sock2))?;
 		Ok(Self {
@@ -436,9 +438,9 @@ impl Relay {
 					return None;
 				}
 				let _ = requester_id; // used for symmetry with Connect; may wire to metrics later
-				// Tell the requester the target accepted, with the target's address — and
-				// advertise the per-session forwarding cap so a relayed client starts its
-				// encoder within the pipe (0 = uncapped).
+						  // Tell the requester the target accepted, with the target's address — and
+						  // advertise the per-session forwarding cap so a relayed client starts its
+						  // encoder within the pipe (0 = uncapped).
 				Some((
 					encode(&RelayMsg::PeerFound {
 						target: id,
@@ -497,8 +499,11 @@ impl Relay {
 				// A6: try_send_to so a backpressured peer can't head-of-line block recv for the
 				// other sessions (a full send buffer drops this datagram like any UDP loss).
 				self.scratch.clear();
-				bincode::serialize_into(&mut self.scratch, &RelayMsg::RelayData { session, payload })
-					.expect("protocol messages are always serializable");
+				bincode::serialize_into(
+					&mut self.scratch,
+					&RelayMsg::RelayData { session, payload },
+				)
+				.expect("protocol messages are always serializable");
 				let _ = self.sock.try_send_to(&self.scratch, dest);
 				None
 			}
@@ -638,15 +643,27 @@ impl Relay {
 		let sz = sz as u64;
 		let (ubps, utot) = (
 			self.limits.per_user_bps,
-			if rate_only { None } else { self.limits.per_user_total },
+			if rate_only {
+				None
+			} else {
+				self.limits.per_user_total
+			},
 		);
 		let (ibps, itot) = (
 			self.limits.per_ip_bps,
-			if rate_only { None } else { self.limits.per_ip_total },
+			if rate_only {
+				None
+			} else {
+				self.limits.per_ip_total
+			},
 		);
 		let (sbps, stot) = (
 			self.limits.per_session_bps,
-			if rate_only { None } else { self.limits.per_session_total },
+			if rate_only {
+				None
+			} else {
+				self.limits.per_session_total
+			},
 		);
 		// The per-session axis engages only on the RelayData hot path (a real SessionId).
 		let session_active = (sbps.is_some() || stot.is_some()) && session.is_some();
@@ -683,7 +700,10 @@ impl Relay {
 		}
 		if session_active {
 			let s = session.unwrap();
-			let m = self.session_meters.entry(s).or_insert_with(|| Meter::new(now));
+			let m = self
+				.session_meters
+				.entry(s)
+				.or_insert_with(|| Meter::new(now));
 			m.last_active = now;
 			if !m.would_allow(now, sz, sbps, stot) {
 				return false;
@@ -851,7 +871,10 @@ mod tests {
 		assert!(reply.is_some(), "hijack attempt should get an error reply");
 		let after = relay.sessions.get(&session).unwrap();
 		assert_eq!(after.requester, a_id, "owner's session must be unchanged");
-		assert_ne!(after.requester, c_id, "attacker must not become the requester");
+		assert_ne!(
+			after.requester, c_id,
+			"attacker must not become the requester"
+		);
 
 		// A's own retry (same requester) is allowed and refreshes the record.
 		assert!(connect(a_id, a_tok, b_id, a)(&mut relay).is_some());
@@ -882,10 +905,17 @@ mod tests {
 		};
 		// Oversized hello → dropped (no reply, no session created, nothing forwarded).
 		let huge = vec![0u8; MAX_HELLO_LEN + 1];
-		assert!(connect(huge, 0x1111, &mut relay).is_none(), "oversized hello must be dropped");
-		assert!(!relay.sessions.contains_key(&0x1111), "no session for a dropped Connect");
+		assert!(
+			connect(huge, 0x1111, &mut relay).is_none(),
+			"oversized hello must be dropped"
+		);
+		assert!(
+			!relay.sessions.contains_key(&0x1111),
+			"no session for a dropped Connect"
+		);
 		// A realistic hello (pubkey||salt||LAN ≈ 70 B) is forwarded to the target's address.
-		let (reply, to) = connect(vec![7u8; 70], 0x2222, &mut relay).expect("normal hello forwarded");
+		let (reply, to) =
+			connect(vec![7u8; 70], 0x2222, &mut relay).expect("normal hello forwarded");
 		assert_eq!(to, b, "Incoming goes to the target's last-seen address");
 		match decode(&reply).unwrap() {
 			RelayMsg::Incoming { hello, .. } => assert_eq!(hello, vec![7u8; 70]),
@@ -917,7 +947,10 @@ mod tests {
 			}),
 			a,
 		);
-		assert!(relay.sessions.contains_key(&session), "session must exist after Connect");
+		assert!(
+			relay.sessions.contains_key(&session),
+			"session must exist after Connect"
+		);
 
 		// B (the target) sends an oversized answer → must be dropped, no PeerFound emitted.
 		let huge_answer = vec![0u8; MAX_HELLO_LEN + 1];
@@ -930,7 +963,10 @@ mod tests {
 			}),
 			b,
 		);
-		assert!(reply.is_none(), "oversized answer must be dropped — no PeerFound emitted");
+		assert!(
+			reply.is_none(),
+			"oversized answer must be dropped — no PeerFound emitted"
+		);
 
 		// B sends a normal-sized answer → PeerFound must reach the requester's address.
 		let reply = relay.handle(
@@ -964,10 +1000,17 @@ mod tests {
 		// A multi-byte name truncated near the cap must stay valid UTF-8 (no panic, no split
 		// codepoint): 'ş' is 2 bytes, so MAX_NAME_LEN/2 + a few of them straddle the cap.
 		let multibyte = "ş".repeat(MAX_NAME_LEN); // 2*MAX_NAME_LEN bytes
-		let (id2, _) = relay.register("203.0.113.9:1001".parse().unwrap(), [2u8; 32], Some(multibyte));
+		let (id2, _) = relay.register(
+			"203.0.113.9:1001".parse().unwrap(),
+			[2u8; 32],
+			Some(multibyte),
+		);
 		let stored2 = relay.devices.get(&id2).unwrap().name.as_ref().unwrap();
 		assert!(stored2.len() <= MAX_NAME_LEN);
-		assert!(stored2.chars().all(|c| c == 'ş'), "must not split a codepoint");
+		assert!(
+			stored2.chars().all(|c| c == 'ş'),
+			"must not split a codepoint"
+		);
 	}
 
 	// The reverse index stays in lock-step with by_pubkey so minted ids are unique and the
@@ -989,7 +1032,10 @@ mod tests {
 		// After both devices go offline past PUBKEY_TTL, gc reaps the mappings AND the index.
 		relay.gc_at(t0 + PUBKEY_TTL + Duration::from_secs(1));
 		assert!(relay.by_pubkey.is_empty());
-		assert!(relay.assigned_ids.is_empty(), "reverse index must track reaping");
+		assert!(
+			relay.assigned_ids.is_empty(),
+			"reverse index must track reaping"
+		);
 	}
 
 	// When by_pubkey hits its size cap, gc() evicts the OLDEST OFFLINE mappings — never an
@@ -1017,7 +1063,11 @@ mod tests {
 		// One more fresh pubkey: the map briefly exceeds the cap until gc() runs (no O(n)
 		// eviction on the hot path).
 		let (new_id, _) = relay.register(addr, [0xBB; 32], None);
-		assert_eq!(relay.by_pubkey.len(), MAX_PUBKEY_MAPPINGS + 1, "map grows by one before gc");
+		assert_eq!(
+			relay.by_pubkey.len(),
+			MAX_PUBKEY_MAPPINGS + 1,
+			"map grows by one before gc"
+		);
 		assert!(relay.assigned_ids.contains(&new_id));
 		// After gc() the map is trimmed back to ≤ MAX_PUBKEY_MAPPINGS. The online device's
 		// mapping must survive; only offline stale entries are culled.
@@ -1078,12 +1128,18 @@ mod tests {
 				break;
 			}
 		}
-		assert!(any_dropped, "flood from one IP must be rate-limited (handle returns None)");
+		assert!(
+			any_dropped,
+			"flood from one IP must be rate-limited (handle returns None)"
+		);
 
 		// A single Register from a DIFFERENT IP must still succeed — the per-IP meter is
 		// independent; the flood from another address must not lock out this one.
 		let legit = relay.handle(&make_register([0xFF; 32]), victim_ip);
-		assert!(legit.is_some(), "Register from a fresh IP must not be blocked by another IP's flood");
+		assert!(
+			legit.is_some(),
+			"Register from a fresh IP must not be blocked by another IP's flood"
+		);
 	}
 
 	// When ONLY per_user_bps is set (no per_ip_bps), two brand-new pubkeys from DIFFERENT
@@ -1119,7 +1175,10 @@ mod tests {
 		// Two brand-new (unknown) pubkeys each from a distinct IP — both must be accepted.
 		let r1 = relay.handle(&make_register([0xA1; 32]), ip_a);
 		let r2 = relay.handle(&make_register([0xB2; 32]), ip_b);
-		assert!(r1.is_some(), "first fresh-pubkey Register must succeed under user-only rate limit");
+		assert!(
+			r1.is_some(),
+			"first fresh-pubkey Register must succeed under user-only rate limit"
+		);
 		assert!(r2.is_some(), "second fresh-pubkey Register from different IP must also succeed (sentinel must not share user bucket)");
 	}
 }

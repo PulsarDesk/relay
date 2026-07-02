@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Build + test the relay on every target OS + arch (incl. ARM Linux for
+  # OrangePi / Raspberry Pi self-hosting). pulsar-proto is fetched from git.
+  rust:
+    name: Rust · ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04,     name: linux-x64 }
+          - { os: ubuntu-22.04-arm, name: linux-arm64 }
+          - { os: windows-latest,   name: windows-x64 }
+          - { os: macos-latest,     name: macos-arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      - name: rustfmt
+        if: matrix.name == 'linux-x64'
+        run: cargo fmt --all --check
+      - name: clippy
+        if: matrix.name == 'linux-x64'
+        run: cargo clippy --all-targets --locked
+      - name: Test
+        run: cargo test --locked
