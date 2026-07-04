@@ -5,6 +5,7 @@ name: Release
 # the repo (no @semantic-release/git plugin). Cross-platform relay binaries are
 # built and attached to that release.
 on:
+  workflow_dispatch:
   push:
     branches: [main]
 
