@@ -3,8 +3,10 @@
 A standalone **Rust** (tokio, UDP) rendezvous + relay server. See `../CLAUDE.md`
 for the product and `../pulsar-proto` for the wire format.
 
-> `cargo` is a rustup proxy honoring `../rust-toolchain.toml` (current stable). If
-> you hit an edition-2024 error, run `rustup update stable` once.
+> `cargo` is a rustup proxy honoring this repo's own `rust-toolchain.toml`
+> (current stable). If you hit an edition-2024 error, run `rustup update stable`
+> once. (`../CLAUDE.md` / `../pulsar-proto` refs assume the umbrella checkout at
+> `~/Projects/pulsar/`; in a standalone clone see the GitHub repos instead.)
 
 ## What it does
 
@@ -18,7 +20,20 @@ for the product and `../pulsar-proto` for the wire format.
    forwarder.
 
 Single-task UDP event loop, so the registry needs no locks. Stale devices/sessions
-are GC'd (`DEVICE_TTL` / `SESSION_TTL`).
+are GC'd (`DEVICE_TTL` 30 s / `SESSION_TTL` 120 s; sweep every 10 s, plus a slow
+60 s pass for pubkey mappings/meters).
+
+Also in the code (beyond the three roles above):
+
+- **Stable identity**: `by_pubkey` maps pubkey → DeviceId so a returning device
+  keeps its 9-digit ID (`PUBKEY_TTL` 30 days, `MAX_PUBKEY_MAPPINGS` 100k with
+  oldest-offline eviction).
+- **Hardening**: protocol-version gate on `Register` (wire-compat `ErrCode::Protocol`
+  reply), per-IP Register throttle, anti-reflection caps (`MAX_RELAY_PAYLOAD` 64 KB,
+  `MAX_HELLO_LEN` on both `hello` and `answer`, `MAX_NAME_LEN`), session-ownership
+  checks on `Accept`/`RelayData` (anti-hijack), `ClientMsg::Bye`.
+- Note `PeerMsg::Hello/HelloAck` (in pulsar-proto) is the relay-less direct-IP
+  path — the relay never sees it.
 
 ## Run
 
@@ -56,9 +71,11 @@ Units: rates accept bit (`mbit`/`gbit`/`mbps`, bare `m`/`g` = bits) or byte (`mb
 **The same flags/env work for the desktop app's relay mode** (`pulsar --relay
 --session-rate 10mbit …`) — both run the same `Relay` (`pulsar_relay::Limits`).
 
-It's a single self-contained binary — easy to self-host (the website shows a
-`docker run … pulsar/relay` flow). The desktop app's relay endpoint is
-user-configurable, so point it at your own.
+It's a single self-contained binary — easy to self-host (the website's marketing
+copy promises a single docker command, but **no Dockerfile exists yet** — write
+one before pointing users at it). The desktop app's relay endpoint is
+user-configurable, so point it at your own. The desktop app can also run this
+same `Relay` itself: `pulsar --relay …` (`relay_mode.rs` in pulsar-desktop).
 
 ## Test
 
@@ -71,6 +88,10 @@ rendezvous, accept, and bidirectional relay forwarding.
 
 ## Layout
 
-- `src/lib.rs` — the `Relay` (bind / run / handlers / registry).
-- `src/main.rs` — clap CLI (`--bind` / `--host` / `--port`, env-configurable).
-- `tests/relay_flow.rs` — integration tests.
+- `src/lib.rs` — the `Relay` (bind / run / handlers / registry) + ~10 in-crate
+  `#[tokio::test]` unit tests.
+- `src/limits.rs` — `Limits` + `parse_rate`/`parse_size` (unit-tested).
+- `src/main.rs` — clap CLI (`--bind` / `--host` / `--port` + the six limit
+  flags, env-configurable).
+- `tests/relay_flow.rs` — integration tests (registration, stable-ID
+  re-registration, heartbeat auth, offline target, full rendezvous + relay).
