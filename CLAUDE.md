@@ -71,11 +71,17 @@ Units: rates accept bit (`mbit`/`gbit`/`mbps`, bare `m`/`g` = bits) or byte (`mb
 **The same flags/env work for the desktop app's relay mode** (`pulsar --relay
 --session-rate 10mbit …`) — both run the same `Relay` (`pulsar_relay::Limits`).
 
-It's a single self-contained binary — easy to self-host (the website's marketing
-copy promises a single docker command, but **no Dockerfile exists yet** — write
-one before pointing users at it). The desktop app's relay endpoint is
-user-configurable, so point it at your own. The desktop app can also run this
-same `Relay` itself: `pulsar --relay …` (`relay_mode.rs` in pulsar-desktop).
+It's a single self-contained binary — easy to self-host. Docker (static musl
+build, `scratch` base; release.yml publishes amd64+arm64 to GHCR on release):
+
+```bash
+docker run -d --name pulsar-relay -p 21116:21116/udp ghcr.io/pulsardesk/relay
+docker run -d -p 21116:21116/udp ghcr.io/pulsardesk/relay --session-rate 10mbit
+```
+
+The desktop app's relay endpoint is user-configurable, so point it at your own.
+The desktop app can also run this same `Relay` itself: `pulsar --relay …`
+(`relay_mode.rs` in pulsar-desktop).
 
 ## Test
 

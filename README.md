@@ -22,6 +22,19 @@ cargo run --release            # binds the default UDP port
 cargo run --release -- --help  # options (bind addr/port, buffers, …)
 ```
 
+### Docker
+
+```bash
+docker run -d --name pulsar-relay -p 21116:21116/udp ghcr.io/pulsardesk/relay
+# with per-session bandwidth limits:
+docker run -d -p 21116:21116/udp ghcr.io/pulsardesk/relay --session-rate 10mbit
+# or build locally:
+docker build -t pulsar-relay . && docker run -d -p 21116:21116/udp pulsar-relay
+```
+
+The image is a static musl build on a `scratch` base (a few MB); the port is
+**UDP**, so the `/udp` suffix matters.
+
 ## Test
 
 ```bash

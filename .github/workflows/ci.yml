@@ -45,3 +45,12 @@ jobs:
         run: cargo clippy --all-targets --locked
       - name: Test
         run: cargo test --locked
+
+  audit:
+    name: Security audit (RustSec)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
