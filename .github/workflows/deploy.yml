@@ -1,0 +1,19 @@
+name: Deploy relay
+
+# Every stable release (semantic-release on main) triggers a redeploy of the
+# Coolify application on projects-vps, which rebuilds from main HEAD (= the
+# release commit). Prereleases from dev are skipped.
+on:
+  release:
+    types: [published]
+
+jobs:
+  deploy:
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Coolify deployment
+        run: |
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${{ secrets.COOLIFY_DEPLOY_TOKEN }}" \
+            "https://coolify.pulsardesk.com/api/v1/deploy?uuid=o7xdy0cqdnibsqi9bl2ds6kh&force=false"
