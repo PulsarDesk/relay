@@ -1,0 +1,7 @@
+# Server deployment (Coolify builds this on projects-vps; see .github/workflows/deploy.yml).
+services:
+  relay:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "21116:21116/udp"
