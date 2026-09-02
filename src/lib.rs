@@ -28,7 +28,10 @@ use tokio::time::{Duration, Instant};
 mod auth;
 mod limits;
 
-pub use auth::{base32_decode, RelayAuth};
+pub use auth::{
+	base32_decode, base32_encode, enrollment_from_secret, generate_totp, otpauth_uri, RelayAuth,
+	TotpEnrollment,
+};
 use auth::AuthCheck;
 pub use limits::{parse_rate, parse_size, Limits};
 use limits::{Meter, METER_TTL};

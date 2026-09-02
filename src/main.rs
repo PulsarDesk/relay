@@ -64,6 +64,13 @@ struct Args {
 	/// real handshake. Default: off (Pulsar sessions are still always E2E either way).
 	#[arg(long, env = "PULSAR_RELAY_REQUIRE_E2E")]
 	require_e2e: bool,
+
+	/// Enroll 2FA: print a fresh TOTP secret with a scannable QR code, the manual-entry
+	/// code for when a QR can't be scanned, and the flag to start the relay with. Prints
+	/// and exits — nothing is stored, so re-running mints a NEW secret. Pass an existing
+	/// `--auth-totp` alongside it to re-display THAT secret's QR instead of rotating it.
+	#[arg(long)]
+	generate_totp: bool,
 }
 
 fn opt_rate(v: &Option<String>, what: &str) -> anyhow::Result<Option<u64>> {
@@ -101,6 +108,33 @@ async fn main() -> anyhow::Result<()> {
 		Some(a) => a,
 		None => format!("{}:{}", args.host, args.port).parse()?,
 	};
+
+	// 2FA enrollment: print the QR + manual code and exit without starting the relay.
+	if args.generate_totp {
+		let label = addr.to_string();
+		// Re-display an existing secret if one was passed, else mint a fresh one — so an
+		// operator can recover a lost QR without invalidating everyone's enrollment.
+		let e = match &args.auth_totp {
+			Some(s) => {
+				pulsar_relay::base32_decode(s)
+					.filter(|b| !b.is_empty())
+					.ok_or_else(|| anyhow::anyhow!("--auth-totp is not a valid base32 secret"))?;
+				pulsar_relay::enrollment_from_secret(s, &label, "Pulsar")
+			}
+			None => pulsar_relay::generate_totp(&label, "Pulsar"),
+		};
+		println!("{}", e.qr_terminal);
+		println!("Pulsar relay 2FA (TOTP) enrollment");
+		println!("  Scan the QR above with any authenticator app (Google Authenticator, Aegis, 1Password, …).");
+		println!("  Can't scan? Enter this code by hand:");
+		println!("      {}", e.secret_grouped);
+		println!("  Setup URI: {}", e.uri);
+		println!();
+		println!("  Then start the relay with:");
+		println!("      pulsar-relay --auth-totp {}", e.secret);
+		println!("  (add --auth-password <pw> to require BOTH factors)");
+		return Ok(());
+	}
 
 	let limits = Limits {
 		per_user_bps: opt_rate(&args.user_rate, "--user-rate")?,

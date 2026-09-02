@@ -175,6 +175,134 @@ fn hotp(secret: &[u8], counter: u64, digits: u32) -> String {
 	format!("{otp:0width$}", width = digits as usize)
 }
 
+/// One 2FA enrollment: everything the operator needs to add the relay to an
+/// authenticator app, and the exact secret to hand back to the relay.
+#[derive(Clone, Debug)]
+pub struct TotpEnrollment {
+	/// The shared secret, base32 (what `--auth-totp` takes).
+	pub secret: String,
+	/// The same secret in 4-character groups — what a human types when a QR can't be
+	/// scanned ("özel kod").
+	pub secret_grouped: String,
+	/// `otpauth://totp/...` URI that authenticator apps consume.
+	pub uri: String,
+	/// The URI rendered as a scannable QR, as an inline SVG document (for app UIs).
+	pub qr_svg: String,
+	/// The URI rendered as a scannable QR in unicode half-blocks (for a terminal).
+	pub qr_terminal: String,
+}
+
+/// Mint a fresh TOTP enrollment for a relay: a random 160-bit secret (the RFC 4226
+/// recommendation, and what authenticator apps expect) plus its QR/manual-entry forms.
+///
+/// `label` is what shows up in the authenticator (e.g. the relay's host:port), `issuer`
+/// the app name. Nothing is stored here — the caller decides whether to run the relay
+/// with the returned secret.
+pub fn generate_totp(label: &str, issuer: &str) -> TotpEnrollment {
+	let mut raw = [0u8; 20];
+	rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut raw);
+	let secret = base32_encode(&raw);
+	enrollment_from_secret(&secret, label, issuer)
+}
+
+/// Build the enrollment views (URI + QRs + grouped form) for an EXISTING base32 secret,
+/// so an operator who already configured one can re-display its QR without rotating it.
+pub fn enrollment_from_secret(secret: &str, label: &str, issuer: &str) -> TotpEnrollment {
+	let uri = otpauth_uri(secret, label, issuer);
+	let (qr_svg, qr_terminal) = render_qr(&uri);
+	TotpEnrollment {
+		secret: secret.to_string(),
+		secret_grouped: group4(secret),
+		uri,
+		qr_svg,
+		qr_terminal,
+	}
+}
+
+/// The `otpauth://totp/` URI authenticator apps scan. Parameters are spelled out
+/// explicitly (SHA1 / 6 digits / 30 s) so an app never has to guess our defaults.
+pub fn otpauth_uri(secret: &str, label: &str, issuer: &str) -> String {
+	format!(
+		"otpauth://totp/{}:{}?secret={}&issuer={}&algorithm=SHA1&digits={}&period={}",
+		percent_encode(issuer),
+		percent_encode(label),
+		secret,
+		percent_encode(issuer),
+		TOTP_DIGITS,
+		TOTP_STEP
+	)
+}
+
+/// Render `data` as a QR twice: an inline SVG document and unicode half-blocks. An
+/// encoding failure (only possible for absurdly long input) yields empty strings rather
+/// than panicking — the caller still has the secret to type in by hand.
+fn render_qr(data: &str) -> (String, String) {
+	use qrcode::render::{svg, unicode};
+	let Ok(code) = qrcode::QrCode::new(data.as_bytes()) else {
+		return (String::new(), String::new());
+	};
+	let svg = code
+		.render::<svg::Color>()
+		.min_dimensions(240, 240)
+		.quiet_zone(true)
+		.dark_color(svg::Color("#000000"))
+		.light_color(svg::Color("#ffffff"))
+		.build();
+	let term = code
+		.render::<unicode::Dense1x2>()
+		.quiet_zone(true)
+		.dark_color(unicode::Dense1x2::Light)
+		.light_color(unicode::Dense1x2::Dark)
+		.build();
+	(svg, term)
+}
+
+/// Split into 4-character groups for readable manual entry (`JBSW Y3DP EHPK …`).
+fn group4(s: &str) -> String {
+	s.chars()
+		.collect::<Vec<_>>()
+		.chunks(4)
+		.map(|c| c.iter().collect::<String>())
+		.collect::<Vec<_>>()
+		.join(" ")
+}
+
+/// Minimal percent-encoding for the otpauth label/issuer (they may contain spaces or
+/// `:`/`/`, which would otherwise break the URI's own structure).
+fn percent_encode(s: &str) -> String {
+	let mut out = String::with_capacity(s.len());
+	for b in s.bytes() {
+		match b {
+			b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+				out.push(b as char)
+			}
+			_ => out.push_str(&format!("%{b:02X}")),
+		}
+	}
+	out
+}
+
+/// Encode bytes as base32 (RFC 4648, uppercase, unpadded) — the form authenticator apps
+/// and `--auth-totp` accept. Inverse of [`base32_decode`].
+pub fn base32_encode(bytes: &[u8]) -> String {
+	const ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+	let mut out = String::new();
+	let mut buffer: u32 = 0;
+	let mut bits: u32 = 0;
+	for &b in bytes {
+		buffer = (buffer << 8) | b as u32;
+		bits += 8;
+		while bits >= 5 {
+			bits -= 5;
+			out.push(ALPHABET[((buffer >> bits) & 0x1f) as usize] as char);
+		}
+	}
+	if bits > 0 {
+		out.push(ALPHABET[((buffer << (5 - bits)) & 0x1f) as usize] as char);
+	}
+	out
+}
+
 /// Decode a base32 (RFC 4648, upper/lowercase, optional `=` padding and spaces) TOTP
 /// secret as pasted from an authenticator setup. Returns `None` on any invalid character.
 pub fn base32_decode(s: &str) -> Option<Vec<u8>> {
@@ -284,6 +412,39 @@ mod tests {
 		assert!(!totp_valid(secret, "000000", 59));
 		// Neighbouring step tolerated.
 		assert!(totp_valid(secret, &hotp(secret, 59 / TOTP_STEP + 1, 6), 59));
+	}
+
+	#[test]
+	fn generated_enrollment_is_usable_end_to_end() {
+		let e = generate_totp("relay.example.com:21116", "Pulsar");
+		// 160-bit secret → 32 base32 chars, decodes back to 20 bytes.
+		assert_eq!(e.secret.len(), 32, "160-bit secret is 32 base32 chars");
+		let raw = base32_decode(&e.secret).expect("generated secret decodes");
+		assert_eq!(raw.len(), 20);
+		// The grouped form is the same secret, just spaced for manual entry.
+		assert_eq!(e.secret_grouped.replace(' ', ""), e.secret);
+		// The URI carries the secret and the explicit parameters.
+		assert!(e.uri.starts_with("otpauth://totp/Pulsar:"), "uri: {}", e.uri);
+		assert!(e.uri.contains(&format!("secret={}", e.secret)));
+		assert!(e.uri.contains("algorithm=SHA1") && e.uri.contains("digits=6") && e.uri.contains("period=30"));
+		// The label was percent-encoded (the ':' in host:port must not split the URI).
+		assert!(e.uri.contains("relay.example.com%3A21116"), "uri: {}", e.uri);
+		// Both QR renderings were produced.
+		assert!(e.qr_svg.contains("<svg") && e.qr_svg.len() > 200, "svg head: {}", &e.qr_svg[..e.qr_svg.len().min(80)]);
+		assert!(!e.qr_terminal.is_empty());
+		// And a code computed from the generated secret verifies — the whole point.
+		let code = hotp(&raw, 1_700_000_000 / TOTP_STEP, 6);
+		assert!(totp_valid(&raw, &code, 1_700_000_000));
+	}
+
+	#[test]
+	fn base32_encode_decode_round_trips() {
+		assert_eq!(base32_encode(b"foobar"), "MZXW6YTBOI");
+		for len in 1..=24 {
+			let bytes: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+			let enc = base32_encode(&bytes);
+			assert_eq!(base32_decode(&enc).unwrap(), bytes, "round trip at len {len}");
+		}
 	}
 
 	#[test]
