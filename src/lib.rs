@@ -346,14 +346,20 @@ impl Relay {
 				// a missing/stale credential gets a fresh nonce (AuthRequired), a wrong one
 				// gets BadAuth. The challenge nonce is stateless (see the auth module), so
 				// there's nothing to track per client on this single-task loop.
+				// `issue_key` is set when the device just satisfied the interactive factors:
+				// it then gets a durable access key so it is never prompted again. A device
+				// that authenticated WITH a key keeps the one it has (KeyOk).
+				let mut issue_key = false;
 				match auth::check(
 					&self.auth,
 					proof.as_ref(),
 					&self.server_secret,
 					from.ip(),
 					Self::unix_now(),
+					&pubkey,
 				) {
-					AuthCheck::Ok => {}
+					AuthCheck::Ok => issue_key = self.auth.needs_credential(),
+					AuthCheck::KeyOk => {}
 					AuthCheck::Challenge { password, totp } => {
 						let nonce =
 							auth::challenge_nonce(&self.server_secret, from.ip(), Self::unix_now());
@@ -382,6 +388,11 @@ impl Relay {
 						id,
 						token,
 						e2e_required: self.auth.require_e2e,
+						// Hand out the durable access key on the registration that just
+						// passed the password/2FA prompt, so the client can store it and
+						// never prompt again (until the operator rotates the credentials).
+						auth_key: issue_key
+							.then(|| auth::issue_key(&self.auth, &pubkey, Self::unix_now())),
 					}),
 					from,
 				))

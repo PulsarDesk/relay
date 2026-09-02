@@ -56,8 +56,12 @@ impl RelayAuth {
 /// The verdict of checking a registration's auth against the policy.
 #[derive(Debug, PartialEq, Eq)]
 pub enum AuthCheck {
-	/// No policy, or the supplied proof satisfied it → allow registration.
+	/// No policy, or the supplied proof satisfied it → allow registration. The caller
+	/// ISSUES a fresh access key so the device never has to be prompted again.
 	Ok,
+	/// The device authenticated with an already-issued access key → allow registration
+	/// WITHOUT minting a new key (it keeps the one it has).
+	KeyOk,
 	/// The client sent no proof (or one bound to a stale/forged nonce) → send a fresh
 	/// challenge. Carries the factors required so the client knows what to prompt for.
 	Challenge { password: bool, totp: bool },
@@ -106,12 +110,16 @@ fn nonce_is_fresh(
 }
 
 /// Check a registration's `auth` proof against the policy.
+///
+/// `pubkey` is the registering device's X25519 public key — access keys are bound to it,
+/// so a key that leaks is useless on any other device.
 pub fn check(
 	auth: &RelayAuth,
 	proof: Option<&pulsar_proto::AuthProof>,
 	server_secret: &[u8; 32],
 	ip: std::net::IpAddr,
 	unix_time: u64,
+	pubkey: &[u8; 32],
 ) -> AuthCheck {
 	if !auth.needs_credential() {
 		return AuthCheck::Ok;
@@ -124,6 +132,23 @@ pub fn check(
 			totp: need_totp,
 		};
 	};
+	// A stored ACCESS KEY short-circuits the interactive factors: this device already
+	// proved itself once. Checked first and, on success, returns `KeyOk` so the caller
+	// knows NOT to mint another key. A key that no longer validates (the operator
+	// changed the relay's credentials, or it was issued by a different relay) falls
+	// through to the normal challenge instead of hard-failing, so the user simply gets
+	// asked for their password/2FA again.
+	if let Some(key) = proof.key.as_deref() {
+		if key_is_valid(auth, key, pubkey) {
+			return AuthCheck::KeyOk;
+		}
+		if proof.password.is_none() && proof.totp.is_none() {
+			return AuthCheck::Challenge {
+				password: need_pw,
+				totp: need_totp,
+			};
+		}
+	}
 	// A proof bound to a nonce we didn't issue (or that has expired) is re-challenged with
 	// a fresh nonce rather than rejected outright — the usual cause is an expired window,
 	// not a wrong credential.
@@ -337,6 +362,104 @@ pub fn base32_decode(s: &str) -> Option<Vec<u8>> {
 	Some(out)
 }
 
+/// How long an issued access key stays valid. Deliberately long: the point is that a
+/// user authenticates once per device. A key is invalidated early by the operator
+/// changing the relay's password / TOTP secret (which rotates the signing key), not by
+/// waiting it out.
+const KEY_TTL_SECS: u64 = 365 * 24 * 60 * 60;
+
+/// The signing key for access keys, derived from the relay's CURRENT credentials.
+///
+/// Deriving it from the policy (rather than a random per-process secret) gives two
+/// properties for free: issued keys survive a relay restart, and changing the password or
+/// the TOTP secret rotates this derivation — instantly invalidating every key the relay
+/// ever handed out. That is exactly the "works forever, until the operator changes it"
+/// contract, with no key database to store, replicate or revoke.
+fn key_signing_secret(auth: &RelayAuth) -> [u8; 32] {
+	let mut h = Sha256::new();
+	h.update(b"pulsar-relay-access-key-v1");
+	h.update(auth.password.as_deref().unwrap_or("").as_bytes());
+	h.update(auth.totp_secret.as_deref().unwrap_or(&[]));
+	h.finalize().into()
+}
+
+/// Mint an access key for `pubkey`: `hex(issued_at_be(8) || mac(16))`, where the MAC
+/// covers the issue time AND the device's public key — so the key only ever authenticates
+/// the device it was issued to.
+pub fn issue_key(auth: &RelayAuth, pubkey: &[u8; 32], unix_time: u64) -> String {
+	let secret = key_signing_secret(auth);
+	let mac = key_mac(&secret, pubkey, unix_time);
+	let mut out = String::with_capacity(48);
+	for b in unix_time.to_be_bytes() {
+		out.push_str(&format!("{b:02x}"));
+	}
+	for b in mac {
+		out.push_str(&format!("{b:02x}"));
+	}
+	out
+}
+
+/// Is `key` one this relay issued to `pubkey`, under the CURRENT credentials, and still
+/// inside [`KEY_TTL_SECS`]? Constant-time MAC compare.
+pub fn key_is_valid(auth: &RelayAuth, key: &str, pubkey: &[u8; 32]) -> bool {
+	let key = key.trim();
+	if key.len() != 48 {
+		return false;
+	}
+	let Some(raw) = hex_decode(key) else {
+		return false;
+	};
+	let mut issued = [0u8; 8];
+	issued.copy_from_slice(&raw[..8]);
+	let issued_at = u64::from_be_bytes(issued);
+	// Reject a key older than the TTL, or one dated absurdly far in the future (a clock
+	// jump on the issuing relay shouldn't mint effectively immortal keys).
+	let now = unix_now();
+	if now.saturating_sub(issued_at) > KEY_TTL_SECS || issued_at.saturating_sub(now) > KEY_TTL_SECS
+	{
+		return false;
+	}
+	let secret = key_signing_secret(auth);
+	let expected = key_mac(&secret, pubkey, issued_at);
+	ct_eq_bytes(&raw[8..], &expected)
+}
+
+/// `HMAC-SHA256(signing_secret, pubkey || issued_at)`, truncated to 16 bytes.
+fn key_mac(secret: &[u8; 32], pubkey: &[u8; 32], issued_at: u64) -> [u8; 16] {
+	use hmac::{Hmac, Mac};
+	type HmacSha256 = Hmac<Sha256>;
+	let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
+	mac.update(pubkey);
+	mac.update(&issued_at.to_be_bytes());
+	let out = mac.finalize().into_bytes();
+	let mut short = [0u8; 16];
+	short.copy_from_slice(&out[..16]);
+	short
+}
+
+/// Current UNIX seconds (0 if the clock is before the epoch).
+fn unix_now() -> u64 {
+	std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map(|d| d.as_secs())
+		.unwrap_or(0)
+}
+
+/// Decode an even-length lowercase/uppercase hex string. `None` on any non-hex byte.
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+	if s.len() % 2 != 0 {
+		return None;
+	}
+	let b = s.as_bytes();
+	let mut out = Vec::with_capacity(s.len() / 2);
+	for pair in b.chunks(2) {
+		let hi = (pair[0] as char).to_digit(16)? as u8;
+		let lo = (pair[1] as char).to_digit(16)? as u8;
+		out.push((hi << 4) | lo);
+	}
+	Some(out)
+}
+
 /// Constant-time equality for two 16-byte challenge/proof values.
 fn ct_eq(a: &[u8; 16], b: &[u8; 16]) -> bool {
 	ct_eq_bytes(a, b)
@@ -365,10 +488,84 @@ mod tests {
 		"203.0.113.7".parse().unwrap()
 	}
 
+	/// The registering device's public key (access keys are bound to it).
+	const PK: [u8; 32] = [0x11; 32];
+
+	#[test]
+	fn issued_key_authenticates_without_the_interactive_factors() {
+		let secret = [7u8; 32];
+		let auth = RelayAuth {
+			password: Some("pw".into()),
+			..Default::default()
+		};
+		let t = unix_now();
+		// Mint the key the relay would hand back after a successful password auth.
+		let key = issue_key(&auth, &PK, t);
+		let proof = AuthProof {
+			nonce: [0u8; 16],
+			password: None,
+			totp: None,
+			key: Some(key.clone()),
+		};
+		// The key alone registers the device — no challenge, and no NEW key is minted.
+		assert_eq!(
+			check(&auth, Some(&proof), &secret, ip(), t, &PK),
+			AuthCheck::KeyOk
+		);
+
+		// Bound to the device: the same key from a DIFFERENT pubkey is not accepted, and
+		// (carrying no interactive factor) simply gets re-challenged.
+		let other = [0x22u8; 32];
+		assert_eq!(
+			check(&auth, Some(&proof), &secret, ip(), t, &other),
+			AuthCheck::Challenge {
+				password: true,
+				totp: false
+			}
+		);
+
+		// Rotating the relay's credentials invalidates every issued key at once.
+		let rotated = RelayAuth {
+			password: Some("new-pw".into()),
+			..Default::default()
+		};
+		assert!(!key_is_valid(&rotated, &key, &PK));
+		assert_eq!(
+			check(&rotated, Some(&proof), &secret, ip(), t, &PK),
+			AuthCheck::Challenge {
+				password: true,
+				totp: false
+			}
+		);
+	}
+
+	#[test]
+	fn garbage_and_tampered_keys_are_rejected() {
+		let auth = RelayAuth {
+			password: Some("pw".into()),
+			..Default::default()
+		};
+		assert!(!key_is_valid(&auth, "", &PK));
+		assert!(!key_is_valid(&auth, "not-hex-at-all", &PK));
+		let good = issue_key(&auth, &PK, unix_now());
+		assert!(key_is_valid(&auth, &good, &PK));
+		// Flip the last nibble of the MAC.
+		let mut bad = good.clone();
+		let last = bad.pop().unwrap();
+		bad.push(if last == '0' { '1' } else { '0' });
+		assert!(!key_is_valid(&auth, &bad, &PK));
+		// A key dated far in the past is expired.
+		let old = issue_key(&auth, &PK, unix_now() - (KEY_TTL_SECS + 60));
+		assert!(!key_is_valid(&auth, &old, &PK));
+	}
+
 	#[test]
 	fn open_relay_allows_without_proof() {
 		let auth = RelayAuth::default();
-		assert_eq!(check(&auth, None, &[0u8; 32], ip(), 1000), AuthCheck::Ok);
+		assert_eq!(
+			check(&auth, None, &[0u8; 32], ip(), 1000, &PK),
+			AuthCheck::Ok
+		);
 		assert!(!auth.needs_credential());
 	}
 
@@ -382,7 +579,7 @@ mod tests {
 		let t = 1_700_000_000;
 		// No proof → challenge for password only.
 		assert_eq!(
-			check(&auth, None, &secret, ip(), t),
+			check(&auth, None, &secret, ip(), t, &PK),
 			AuthCheck::Challenge {
 				password: true,
 				totp: false
@@ -394,15 +591,23 @@ mod tests {
 			nonce,
 			password: Some(pulsar_proto::password_proof(&nonce, "hunter2")),
 			totp: None,
+			key: None,
 		};
-		assert_eq!(check(&auth, Some(&good), &secret, ip(), t), AuthCheck::Ok);
+		assert_eq!(
+			check(&auth, Some(&good), &secret, ip(), t, &PK),
+			AuthCheck::Ok
+		);
 		// Wrong password → Bad.
 		let bad = AuthProof {
 			nonce,
 			password: Some(pulsar_proto::password_proof(&nonce, "wrong")),
 			totp: None,
+			key: None,
 		};
-		assert_eq!(check(&auth, Some(&bad), &secret, ip(), t), AuthCheck::Bad);
+		assert_eq!(
+			check(&auth, Some(&bad), &secret, ip(), t, &PK),
+			AuthCheck::Bad
+		);
 	}
 
 	#[test]
@@ -418,9 +623,10 @@ mod tests {
 			nonce: old_nonce,
 			password: Some(pulsar_proto::password_proof(&old_nonce, "pw")),
 			totp: None,
+			key: None,
 		};
 		assert_eq!(
-			check(&auth, Some(&proof), &secret, ip(), t),
+			check(&auth, Some(&proof), &secret, ip(), t, &PK),
 			AuthCheck::Challenge {
 				password: true,
 				totp: false
@@ -522,7 +728,7 @@ mod tests {
 		};
 		let t = 1_700_000_000;
 		assert_eq!(
-			check(&auth, None, &secret, ip(), t),
+			check(&auth, None, &secret, ip(), t, &PK),
 			AuthCheck::Challenge {
 				password: true,
 				totp: true
@@ -534,9 +740,10 @@ mod tests {
 			nonce,
 			password: Some(pulsar_proto::password_proof(&nonce, "pw")),
 			totp: None,
+			key: None,
 		};
 		assert_eq!(
-			check(&auth, Some(&no_totp), &secret, ip(), t),
+			check(&auth, Some(&no_totp), &secret, ip(), t, &PK),
 			AuthCheck::Bad
 		);
 		// Right password + right TOTP → Ok.
@@ -545,7 +752,11 @@ mod tests {
 			nonce,
 			password: Some(pulsar_proto::password_proof(&nonce, "pw")),
 			totp: Some(code),
+			key: None,
 		};
-		assert_eq!(check(&auth, Some(&both), &secret, ip(), t), AuthCheck::Ok);
+		assert_eq!(
+			check(&auth, Some(&both), &secret, ip(), t, &PK),
+			AuthCheck::Ok
+		);
 	}
 }
