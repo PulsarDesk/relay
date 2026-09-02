@@ -25,8 +25,11 @@ use pulsar_proto::{
 use tokio::net::UdpSocket;
 use tokio::time::{Duration, Instant};
 
+mod auth;
 mod limits;
 
+pub use auth::{base32_decode, RelayAuth};
+use auth::AuthCheck;
 pub use limits::{parse_rate, parse_size, Limits};
 use limits::{Meter, METER_TTL};
 
@@ -119,6 +122,12 @@ pub struct Relay {
 	assigned_ids: AHashSet<DeviceId>,
 	/// Operator bandwidth limits (default: unlimited — see [`Limits`]).
 	limits: Limits,
+	/// Operator authentication policy (default: open — no password/TOTP, E2E not forced).
+	/// See [`RelayAuth`].
+	auth: RelayAuth,
+	/// Random per-process secret keying the stateless challenge nonce. Never leaves the
+	/// relay; regenerated on restart (a restart just re-challenges in-flight registrations).
+	server_secret: [u8; 32],
 	/// Per-device + per-IP rate/volume meters (only populated when a limit is set).
 	user_meters: AHashMap<DeviceId, Meter>,
 	ip_meters: AHashMap<IpAddr, Meter>,
@@ -158,6 +167,8 @@ impl Relay {
 			}
 		}
 		let sock = UdpSocket::from_std(std::net::UdpSocket::from(sock2))?;
+		let mut server_secret = [0u8; 32];
+		rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut server_secret);
 		Ok(Self {
 			sock,
 			devices: AHashMap::new(),
@@ -165,6 +176,8 @@ impl Relay {
 			by_pubkey: AHashMap::new(),
 			assigned_ids: AHashSet::new(),
 			limits: Limits::default(),
+			auth: RelayAuth::default(),
+			server_secret,
 			user_meters: AHashMap::new(),
 			ip_meters: AHashMap::new(),
 			session_meters: AHashMap::new(),
@@ -177,6 +190,23 @@ impl Relay {
 	pub fn with_limits(mut self, limits: Limits) -> Self {
 		self.limits = limits;
 		self
+	}
+
+	/// Apply an operator authentication policy (builder; default is open). When a password
+	/// and/or TOTP secret is set the relay challenges every registration; when `require_e2e`
+	/// is set it advertises the E2E policy and refuses a Connect that isn't carrying a real
+	/// handshake. Used by the standalone binary and the apps' relay-hosting modes.
+	pub fn with_auth(mut self, auth: RelayAuth) -> Self {
+		self.auth = auth;
+		self
+	}
+
+	/// Current UNIX time in whole seconds (for the auth challenge/TOTP windows).
+	fn unix_now() -> u64 {
+		std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map(|d| d.as_secs())
+			.unwrap_or(0)
 	}
 
 	/// The actual bound address (useful after binding to port 0).
@@ -256,6 +286,7 @@ impl Relay {
 				version,
 				pubkey,
 				name,
+				auth: proof,
 			} => {
 				// Reject an incompatible wire version up front. The per-session handshake
 				// blob format is version-specific (v2 added a 32-byte salt), so a mismatched
@@ -307,9 +338,43 @@ impl Relay {
 					tracing::debug!(%from, "register rate-limited (DoS throttle)");
 					return None;
 				}
+				// v4 auth policy. An open relay (no password/TOTP) short-circuits to Ok and
+				// behaves exactly as before. Otherwise the client must answer a challenge:
+				// a missing/stale credential gets a fresh nonce (AuthRequired), a wrong one
+				// gets BadAuth. The challenge nonce is stateless (see the auth module), so
+				// there's nothing to track per client on this single-task loop.
+				match auth::check(
+					&self.auth,
+					proof.as_ref(),
+					&self.server_secret,
+					from.ip(),
+					Self::unix_now(),
+				) {
+					AuthCheck::Ok => {}
+					AuthCheck::Challenge { password, totp } => {
+						let nonce =
+							auth::challenge_nonce(&self.server_secret, from.ip(), Self::unix_now());
+						tracing::debug!(%from, password, totp, "register: auth challenge issued");
+						return Some((
+							encode(&RelayMsg::AuthRequired { password, totp, nonce }),
+							from,
+						));
+					}
+					AuthCheck::Bad => {
+						tracing::warn!(%from, "register: auth failed (bad credential)");
+						return Some((Self::err(ErrCode::BadAuth, "relay authentication failed"), from));
+					}
+				}
 				let (id, token) = self.register(from, pubkey, name);
 				tracing::info!(%id, %from, "device registered");
-				Some((encode(&RelayMsg::Registered { id, token }), from))
+				Some((
+					encode(&RelayMsg::Registered {
+						id,
+						token,
+						e2e_required: self.auth.require_e2e,
+					}),
+					from,
+				))
 			}
 
 			ClientMsg::Heartbeat { id, token } => {
@@ -341,6 +406,17 @@ impl Relay {
 				// toward the target's address. A real handshake is ~70 bytes (see MAX_HELLO_LEN).
 				if hello.len() > MAX_HELLO_LEN {
 					return None;
+				}
+				// E2E-required relay: refuse to rendezvous a Connect that isn't carrying a real
+				// end-to-end handshake. A Pulsar `hello` is `pubkey(32) || salt(32)` plus an
+				// optional LAN candidate, so anything shorter than 64 bytes cannot be
+				// establishing the encrypted session — reject it rather than forward a path
+				// that would run without E2E. Compliant clients always send a full handshake,
+				// so this only trips a deliberately non-E2E client. (Pulsar's own sessions are
+				// always encrypted; this is the teeth behind the advertised policy.)
+				if self.auth.require_e2e && hello.len() < 64 {
+					tracing::warn!(requester = %id, %target, hello_len = hello.len(), "relay: rejecting non-E2E Connect (require_e2e)");
+					return Some((Self::err(ErrCode::Protocol, "relay requires end-to-end encryption"), from));
 				}
 				// keep requester's observed addr fresh
 				if let Some(dev) = self.devices.get_mut(&id) {
@@ -1111,6 +1187,7 @@ mod tests {
 				version: PROTOCOL_VERSION,
 				pubkey: pk,
 				name: None,
+				auth: None,
 			})
 		};
 
@@ -1169,6 +1246,7 @@ mod tests {
 				version: PROTOCOL_VERSION,
 				pubkey: pk,
 				name: None,
+				auth: None,
 			})
 		};
 

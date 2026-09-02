@@ -50,11 +50,12 @@ async fn register(sock: &UdpSocket, relay: SocketAddr, name: &str) -> (DeviceId,
 			version: PROTOCOL_VERSION,
 			pubkey,
 			name: Some(name.into()),
+			auth: None,
 		},
 	)
 	.await;
 	match recv(sock).await {
-		RelayMsg::Registered { id, token } => (id, token),
+		RelayMsg::Registered { id, token, .. } => (id, token),
 		other => panic!("expected Registered, got {other:?}"),
 	}
 }
