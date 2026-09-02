@@ -148,3 +148,16 @@ jobs:
           tags: |
             ghcr.io/pulsardesk/relay:latest
             ghcr.io/pulsardesk/relay:${{ needs.prepare.outputs.version }}
+
+  # 5. Roll the new build onto the official relay (relay.pulsardesk.com). Runs only
+  #    when a release was actually published, after the image is on GHCR. Calling the
+  #    Deploy workflow (rather than letting it listen for `release: published`) is
+  #    deliberate: a release created with GITHUB_TOKEN never triggers other workflows,
+  #    which is why the old `on: release` deploy never fired and the relay stayed on an
+  #    old protocol build.
+  deploy:
+    name: Deploy the official relay
+    needs: [prepare, publish, docker]
+    if: needs.prepare.outputs.published == 'true'
+    uses: ./.github/workflows/deploy.yml
+    secrets: inherit

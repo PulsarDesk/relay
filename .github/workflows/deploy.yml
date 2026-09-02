@@ -1,15 +1,23 @@
 name: Deploy relay
 
-# Every stable release (semantic-release on main) triggers a redeploy of the
-# Coolify application on projects-vps, which rebuilds from main HEAD (= the
-# release commit). Prereleases from dev are skipped.
+# Redeploys the Coolify application that serves the official relay
+# (relay.pulsardesk.com). Coolify rebuilds from this repo's main HEAD, so the
+# deployment lands on whatever main points at when this runs.
+#
+# WHY THIS IS NOT `on: release`: it used to be, and it NEVER fired once. The
+# release is created by semantic-release using the workflow's own GITHUB_TOKEN,
+# and GitHub deliberately does not start new workflow runs from events raised by
+# GITHUB_TOKEN (loop prevention) — so `release: published` never reached this
+# workflow and the official relay silently stayed on an old build. The Release
+# workflow now CALLS this one (`workflow_call`) after it publishes, which has no
+# such restriction. `workflow_dispatch` is kept for a manual redeploy.
 on:
-  release:
-    types: [published]
+  workflow_call:
+  workflow_dispatch:
 
 jobs:
   deploy:
-    if: ${{ !github.event.release.prerelease }}
+    name: Trigger Coolify redeploy
     runs-on: ubuntu-latest
     steps:
       - name: Trigger Coolify deployment
