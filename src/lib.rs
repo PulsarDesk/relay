@@ -28,11 +28,11 @@ use tokio::time::{Duration, Instant};
 mod auth;
 mod limits;
 
+use auth::AuthCheck;
 pub use auth::{
 	base32_decode, base32_encode, enrollment_from_secret, generate_totp, otpauth_uri, RelayAuth,
 	TotpEnrollment,
 };
-use auth::AuthCheck;
 pub use limits::{parse_rate, parse_size, Limits};
 use limits::{Meter, METER_TTL};
 
@@ -359,13 +359,20 @@ impl Relay {
 							auth::challenge_nonce(&self.server_secret, from.ip(), Self::unix_now());
 						tracing::debug!(%from, password, totp, "register: auth challenge issued");
 						return Some((
-							encode(&RelayMsg::AuthRequired { password, totp, nonce }),
+							encode(&RelayMsg::AuthRequired {
+								password,
+								totp,
+								nonce,
+							}),
 							from,
 						));
 					}
 					AuthCheck::Bad => {
 						tracing::warn!(%from, "register: auth failed (bad credential)");
-						return Some((Self::err(ErrCode::BadAuth, "relay authentication failed"), from));
+						return Some((
+							Self::err(ErrCode::BadAuth, "relay authentication failed"),
+							from,
+						));
 					}
 				}
 				let (id, token) = self.register(from, pubkey, name);
@@ -419,7 +426,10 @@ impl Relay {
 				// always encrypted; this is the teeth behind the advertised policy.)
 				if self.auth.require_e2e && hello.len() < 64 {
 					tracing::warn!(requester = %id, %target, hello_len = hello.len(), "relay: rejecting non-E2E Connect (require_e2e)");
-					return Some((Self::err(ErrCode::Protocol, "relay requires end-to-end encryption"), from));
+					return Some((
+						Self::err(ErrCode::Protocol, "relay requires end-to-end encryption"),
+						from,
+					));
 				}
 				// keep requester's observed addr fresh
 				if let Some(dev) = self.devices.get_mut(&id) {

@@ -87,7 +87,12 @@ fn nonce_for_window(server_secret: &[u8; 32], ip: std::net::IpAddr, window: u64)
 
 /// Is `nonce` one this relay issued to `ip` within the accepted window (current or
 /// previous)? Constant-time compared so timing can't reveal how close a forged nonce was.
-fn nonce_is_fresh(server_secret: &[u8; 32], ip: std::net::IpAddr, unix_time: u64, nonce: &[u8; 16]) -> bool {
+fn nonce_is_fresh(
+	server_secret: &[u8; 32],
+	ip: std::net::IpAddr,
+	unix_time: u64,
+	nonce: &[u8; 16],
+) -> bool {
 	let window = unix_time / NONCE_STEP;
 	let cur = nonce_for_window(server_secret, ip, window);
 	// `window - 1` only when window > 0 (relay uptime is always well past the epoch, but
@@ -114,13 +119,19 @@ pub fn check(
 	let need_pw = auth.password.is_some();
 	let need_totp = auth.totp_secret.is_some();
 	let Some(proof) = proof else {
-		return AuthCheck::Challenge { password: need_pw, totp: need_totp };
+		return AuthCheck::Challenge {
+			password: need_pw,
+			totp: need_totp,
+		};
 	};
 	// A proof bound to a nonce we didn't issue (or that has expired) is re-challenged with
 	// a fresh nonce rather than rejected outright — the usual cause is an expired window,
 	// not a wrong credential.
 	if !nonce_is_fresh(server_secret, ip, unix_time, &proof.nonce) {
-		return AuthCheck::Challenge { password: need_pw, totp: need_totp };
+		return AuthCheck::Challenge {
+			password: need_pw,
+			totp: need_totp,
+		};
 	}
 	if let Some(pw) = &auth.password {
 		let expected = pulsar_proto::password_proof(&proof.nonce, pw);
@@ -364,32 +375,56 @@ mod tests {
 	#[test]
 	fn password_challenge_then_success() {
 		let secret = [9u8; 32];
-		let auth = RelayAuth { password: Some("hunter2".into()), ..Default::default() };
+		let auth = RelayAuth {
+			password: Some("hunter2".into()),
+			..Default::default()
+		};
 		let t = 1_700_000_000;
 		// No proof → challenge for password only.
 		assert_eq!(
 			check(&auth, None, &secret, ip(), t),
-			AuthCheck::Challenge { password: true, totp: false }
+			AuthCheck::Challenge {
+				password: true,
+				totp: false
+			}
 		);
 		// Build the proof the client would send from the issued nonce.
 		let nonce = challenge_nonce(&secret, ip(), t);
-		let good = AuthProof { nonce, password: Some(pulsar_proto::password_proof(&nonce, "hunter2")), totp: None };
+		let good = AuthProof {
+			nonce,
+			password: Some(pulsar_proto::password_proof(&nonce, "hunter2")),
+			totp: None,
+		};
 		assert_eq!(check(&auth, Some(&good), &secret, ip(), t), AuthCheck::Ok);
 		// Wrong password → Bad.
-		let bad = AuthProof { nonce, password: Some(pulsar_proto::password_proof(&nonce, "wrong")), totp: None };
+		let bad = AuthProof {
+			nonce,
+			password: Some(pulsar_proto::password_proof(&nonce, "wrong")),
+			totp: None,
+		};
 		assert_eq!(check(&auth, Some(&bad), &secret, ip(), t), AuthCheck::Bad);
 	}
 
 	#[test]
 	fn stale_nonce_is_rechallenged_not_rejected() {
 		let secret = [1u8; 32];
-		let auth = RelayAuth { password: Some("pw".into()), ..Default::default() };
+		let auth = RelayAuth {
+			password: Some("pw".into()),
+			..Default::default()
+		};
 		let t = 1_700_000_000;
 		let old_nonce = challenge_nonce(&secret, ip(), t - 10 * NONCE_STEP); // far in the past
-		let proof = AuthProof { nonce: old_nonce, password: Some(pulsar_proto::password_proof(&old_nonce, "pw")), totp: None };
+		let proof = AuthProof {
+			nonce: old_nonce,
+			password: Some(pulsar_proto::password_proof(&old_nonce, "pw")),
+			totp: None,
+		};
 		assert_eq!(
 			check(&auth, Some(&proof), &secret, ip(), t),
-			AuthCheck::Challenge { password: true, totp: false }
+			AuthCheck::Challenge {
+				password: true,
+				totp: false
+			}
 		);
 	}
 
@@ -424,13 +459,29 @@ mod tests {
 		// The grouped form is the same secret, just spaced for manual entry.
 		assert_eq!(e.secret_grouped.replace(' ', ""), e.secret);
 		// The URI carries the secret and the explicit parameters.
-		assert!(e.uri.starts_with("otpauth://totp/Pulsar:"), "uri: {}", e.uri);
+		assert!(
+			e.uri.starts_with("otpauth://totp/Pulsar:"),
+			"uri: {}",
+			e.uri
+		);
 		assert!(e.uri.contains(&format!("secret={}", e.secret)));
-		assert!(e.uri.contains("algorithm=SHA1") && e.uri.contains("digits=6") && e.uri.contains("period=30"));
+		assert!(
+			e.uri.contains("algorithm=SHA1")
+				&& e.uri.contains("digits=6")
+				&& e.uri.contains("period=30")
+		);
 		// The label was percent-encoded (the ':' in host:port must not split the URI).
-		assert!(e.uri.contains("relay.example.com%3A21116"), "uri: {}", e.uri);
+		assert!(
+			e.uri.contains("relay.example.com%3A21116"),
+			"uri: {}",
+			e.uri
+		);
 		// Both QR renderings were produced.
-		assert!(e.qr_svg.contains("<svg") && e.qr_svg.len() > 200, "svg head: {}", &e.qr_svg[..e.qr_svg.len().min(80)]);
+		assert!(
+			e.qr_svg.contains("<svg") && e.qr_svg.len() > 200,
+			"svg head: {}",
+			&e.qr_svg[..e.qr_svg.len().min(80)]
+		);
 		assert!(!e.qr_terminal.is_empty());
 		// And a code computed from the generated secret verifies — the whole point.
 		let code = hotp(&raw, 1_700_000_000 / TOTP_STEP, 6);
@@ -443,7 +494,11 @@ mod tests {
 		for len in 1..=24 {
 			let bytes: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
 			let enc = base32_encode(&bytes);
-			assert_eq!(base32_decode(&enc).unwrap(), bytes, "round trip at len {len}");
+			assert_eq!(
+				base32_decode(&enc).unwrap(),
+				bytes,
+				"round trip at len {len}"
+			);
 		}
 	}
 
@@ -468,15 +523,29 @@ mod tests {
 		let t = 1_700_000_000;
 		assert_eq!(
 			check(&auth, None, &secret, ip(), t),
-			AuthCheck::Challenge { password: true, totp: true }
+			AuthCheck::Challenge {
+				password: true,
+				totp: true
+			}
 		);
 		let nonce = challenge_nonce(&secret, ip(), t);
 		// Right password, missing TOTP → Bad.
-		let no_totp = AuthProof { nonce, password: Some(pulsar_proto::password_proof(&nonce, "pw")), totp: None };
-		assert_eq!(check(&auth, Some(&no_totp), &secret, ip(), t), AuthCheck::Bad);
+		let no_totp = AuthProof {
+			nonce,
+			password: Some(pulsar_proto::password_proof(&nonce, "pw")),
+			totp: None,
+		};
+		assert_eq!(
+			check(&auth, Some(&no_totp), &secret, ip(), t),
+			AuthCheck::Bad
+		);
 		// Right password + right TOTP → Ok.
 		let code = hotp(&totp_secret, t / TOTP_STEP, 6);
-		let both = AuthProof { nonce, password: Some(pulsar_proto::password_proof(&nonce, "pw")), totp: Some(code) };
+		let both = AuthProof {
+			nonce,
+			password: Some(pulsar_proto::password_proof(&nonce, "pw")),
+			totp: Some(code),
+		};
 		assert_eq!(check(&auth, Some(&both), &secret, ip(), t), AuthCheck::Ok);
 	}
 }
