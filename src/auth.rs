@@ -196,7 +196,7 @@ pub fn totp_valid(secret: &[u8], code: &str, unix_time: u64) -> bool {
 
 /// RFC 4226 HOTP with HMAC-SHA1, returning a zero-padded `digits`-length decimal string.
 fn hotp(secret: &[u8], counter: u64, digits: u32) -> String {
-	use hmac::{Hmac, Mac};
+	use hmac::{Hmac, KeyInit, Mac};
 	use sha1::Sha1;
 	type HmacSha1 = Hmac<Sha1>;
 	let mut mac = HmacSha1::new_from_slice(secret).expect("HMAC accepts any key length");
@@ -236,7 +236,7 @@ pub struct TotpEnrollment {
 /// with the returned secret.
 pub fn generate_totp(label: &str, issuer: &str) -> TotpEnrollment {
 	let mut raw = [0u8; 20];
-	rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut raw);
+	rand::Rng::fill_bytes(&mut rand::rng(), &mut raw);
 	let secret = base32_encode(&raw);
 	enrollment_from_secret(&secret, label, issuer)
 }
@@ -426,7 +426,7 @@ pub fn key_is_valid(auth: &RelayAuth, key: &str, pubkey: &[u8; 32]) -> bool {
 
 /// `HMAC-SHA256(signing_secret, pubkey || issued_at)`, truncated to 16 bytes.
 fn key_mac(secret: &[u8; 32], pubkey: &[u8; 32], issued_at: u64) -> [u8; 16] {
-	use hmac::{Hmac, Mac};
+	use hmac::{Hmac, KeyInit, Mac};
 	type HmacSha256 = Hmac<Sha256>;
 	let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
 	mac.update(pubkey);
@@ -653,6 +653,85 @@ mod tests {
 		assert!(!totp_valid(secret, "000000", 59));
 		// Neighbouring step tolerated.
 		assert!(totp_valid(secret, &hotp(secret, 59 / TOTP_STEP + 1, 6), 59));
+	}
+
+	fn hex(b: &[u8]) -> String {
+		b.iter().map(|x| format!("{x:02x}")).collect()
+	}
+
+	/// Known-answer: RFC 4226 Appendix D HOTP values (6 digits) and RFC 6238 Appendix B
+	/// SHA-1 TOTP values (8 digits) — pins the HMAC-SHA1 output across hmac/sha1 upgrades.
+	#[test]
+	fn hotp_totp_rfc_known_answers() {
+		let secret = b"12345678901234567890";
+		let rfc4226 = [
+			"755224", "287082", "359152", "969429", "338314", "254676", "287922", "162583",
+			"399871", "520489",
+		];
+		for (c, want) in rfc4226.iter().enumerate() {
+			assert_eq!(hotp(secret, c as u64, 6), *want, "HOTP counter {c}");
+		}
+		for (t, want) in [
+			(59u64, "94287082"),
+			(1_111_111_109, "07081804"),
+			(1_111_111_111, "14050471"),
+			(1_234_567_890, "89005924"),
+			(2_000_000_000, "69279037"),
+			(20_000_000_000, "65353130"),
+		] {
+			assert_eq!(hotp(secret, t / TOTP_STEP, 8), want, "TOTP T={t}");
+		}
+	}
+
+	/// Known-answer: the stateless challenge nonce `SHA-256(secret || ip || window)[..16]`.
+	/// Expected values computed independently (Python hashlib).
+	#[test]
+	fn challenge_nonce_known_answer() {
+		let secret = [7u8; 32];
+		assert_eq!(
+			hex(&nonce_for_window(&secret, ip(), 56_666_666)),
+			"28c2121bb7070ba1beeb5eb38e148d5e"
+		);
+		assert_eq!(
+			hex(&challenge_nonce(
+				&secret,
+				ip(),
+				56_666_666 * NONCE_STEP + 29
+			)),
+			"28c2121bb7070ba1beeb5eb38e148d5e"
+		);
+		assert_eq!(
+			hex(&nonce_for_window(
+				&secret,
+				"2001:db8::1".parse().unwrap(),
+				0
+			)),
+			"bd84456a437fca83b280a075d497ee01"
+		);
+	}
+
+	/// Known-answer: durable access keys are persisted on clients, so the signing-secret
+	/// derivation (SHA-256) and the HMAC-SHA256 MAC must stay byte-identical forever.
+	/// Expected values computed independently (Python hashlib/hmac).
+	#[test]
+	fn access_key_known_answer() {
+		let auth = RelayAuth {
+			password: Some("pw".into()),
+			totp_secret: Some(b"12345678901234567890".to_vec()),
+			..Default::default()
+		};
+		assert_eq!(
+			hex(&key_signing_secret(&auth)),
+			"f0f96c83c3be6318acb25c9c054ecacf180a1157974c3b7cae508fc98ec9a316"
+		);
+		assert_eq!(
+			issue_key(&auth, &PK, 1_700_000_000),
+			"000000006553f10000603baf861ac1079a47f2ea3a244a99"
+		);
+		assert_eq!(
+			issue_key(&RelayAuth::default(), &PK, 1_700_000_000),
+			"000000006553f1009879a8aead9faa258ab18d0dafbda2aa"
+		);
 	}
 
 	#[test]

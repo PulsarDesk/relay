@@ -171,7 +171,7 @@ impl Relay {
 		}
 		let sock = UdpSocket::from_std(std::net::UdpSocket::from(sock2))?;
 		let mut server_secret = [0u8; 32];
-		rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut server_secret);
+		rand::Rng::fill_bytes(&mut rand::rng(), &mut server_secret);
 		Ok(Self {
 			sock,
 			devices: AHashMap::new(),
@@ -634,7 +634,7 @@ impl Relay {
 		//     single entry can't pin unbounded memory;
 		// (3) `by_pubkey` is capped at MAX_PUBKEY_MAPPINGS: gc() amortises offline eviction
 		//     over its 10-second period (already O(n)) instead of stalling the hot path.
-		let mut rng = rand::thread_rng();
+		let mut rng = rand::rng();
 		let now = Self::now();
 		let name = name.map(|mut n| {
 			if n.len() > MAX_NAME_LEN {
