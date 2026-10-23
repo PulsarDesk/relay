@@ -1,78 +1,94 @@
-# Pulsar relay
+<p align="center">
+  <img width="120" height="120" src="https://raw.githubusercontent.com/PulsarDesk/.github/main/profile/logo.svg" alt="Pulsar logo">
+</p>
 
-Self-hostable **relay / rendezvous server** for
-[Pulsar](https://github.com/PulsarDesk) — the free, open-source remote-desktop +
-game-streaming app.
+<h1 align="center">Pulsar Relay</h1>
 
-The relay does three jobs:
+<p align="center">
+  Run your own Pulsar server: your own device IDs and your own fallback when a direct connection isn't possible. 🛰️
+</p>
 
-- **Issues device IDs** — assigns each device its stable 9-digit ID
-  (mapped by public key, so a device keeps its ID across restarts).
-- **Coordinates P2P** — brokers the rendezvous + UDP hole-punch between two peers.
-- **Relays traffic** — forwards ciphertext when direct P2P fails (NAT/firewall).
+<p align="center">
+  <img src="https://img.shields.io/maintenance/yes/2026?style=for-the-badge" alt="Maintained">
+  <a href="https://github.com/PulsarDesk/relay/releases"><img src="https://img.shields.io/github/v/release/PulsarDesk/relay?include_prereleases&style=for-the-badge" alt="Release"></a>
+  <a href="https://github.com/PulsarDesk/relay/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/PulsarDesk/relay/ci.yml?branch=main&style=for-the-badge&label=CI" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/PulsarDesk/relay?style=for-the-badge" alt="License"></a>
+</p>
 
-It is **zero-knowledge**: all session traffic is end-to-end encrypted (X25519 +
-ChaCha20-Poly1305), so the relay only ever forwards opaque ciphertext. Run your
-own and you own identity distribution + fallback transport end to end.
+---
 
-## Run
+## 🚀 Project Status
+**Current Status:** Alpha (0.x). Pulsar works out of the box with the public relay; run your own when you want
+everything on your side.
+
+The relay gives each device its ID, helps two devices find each other, and forwards traffic when they can't connect
+directly. Sessions are end-to-end encrypted, so the relay only ever sees scrambled data.
+
+---
+
+## 📦 Other Pulsar Repositories
+- [**pulsar-desktop**](https://github.com/PulsarDesk/pulsar-desktop) - Pulsar for Windows, macOS and Linux
+- [**pulsar-mobile**](https://github.com/PulsarDesk/pulsar-mobile) - Pulsar for Android
+- [**pulsar-core**](https://github.com/PulsarDesk/pulsar-core) - The shared engine behind both apps
+
+---
+
+## ⚡ Running a relay
+- **Docker (easiest):**
 
 ```bash
-cargo run --release            # binds the default UDP port
-cargo run --release -- --help  # options (bind addr/port, buffers, …)
+docker run -d --name pulsar-relay --restart unless-stopped -p 21116:21116/udp ghcr.io/pulsardesk/relay
 ```
 
-### Authentication (optional — default OPEN)
+- **Binary:** download `pulsar-relay` for your system from the [latest release](https://github.com/PulsarDesk/relay/releases/latest)
+  (Linux x64 / arm64, Windows x64, macOS) and run it.
+- **On your phone:** the [Android app](https://github.com/PulsarDesk/pulsar-mobile) can run a relay for your Wi-Fi
+  (Settings).
 
-A relay can require a **password**, a **TOTP (2FA) code**, or both, and can advertise +
-enforce end-to-end encryption. All off by default.
+Open **UDP port 21116** on your firewall. Then in Pulsar on every device: Settings -> Network -> relay
+`your-server:21116`.
 
+Optional password, 2FA and bandwidth limits: `pulsar-relay --help` and [docs/self-hosting.md](docs/self-hosting.md).
+
+### Where it has been tested
+| Where | Status |
+|---|---|
+| Linux x64, Docker | ✅ runs the public relay |
+| Android (inside the app) | ✅ |
+| Linux arm64, Windows, macOS binaries | ❔ built on every release, not tested |
+
+---
+
+## 🐞 Reporting a bug
+[Open an issue](https://github.com/PulsarDesk/relay/issues/new/choose) and include:
+
+- Relay version (`pulsar-relay --version`) and how you run it (Docker, binary, phone)
+- Your options, **without passwords or 2FA secrets**
+- What the app shows when it fails, and the relay's output around that time
+
+---
+
+## 🛠️ Requirements
+**To run:** any Linux, Windows or macOS machine reachable on one UDP port. It uses very little CPU and memory; the
+bandwidth it needs depends on how many sessions can't connect directly.
+
+**For contributors / development:** Rust stable.
+
+---
+
+## 🤝 Contributing
+Everyone can open [issues](https://github.com/PulsarDesk/relay/issues) and pull requests. Irrelevant or abusive
+issues may be closed or removed. Commits follow [Conventional Commits](https://www.conventionalcommits.org).
+
+### Development Guide
 ```bash
-pulsar-relay --auth-password s3cret                 # password only
-pulsar-relay --auth-totp JBSWY3DPEHPK3PXP           # 2FA only (base32 secret)
-pulsar-relay --auth-password s3cret --auth-totp …   # both = MFA
-pulsar-relay --require-e2e                          # advertise + enforce E2E
-```
-
-The raw password never travels the plaintext UDP control wire — the relay issues a
-per-attempt challenge nonce and the client returns `SHA-256(nonce || password)`. TOTP is
-RFC 6238 (HMAC-SHA1, 6 digits, 30 s).
-
-**Enrolling 2FA** prints a scannable QR plus a manual-entry code for when a QR can't be
-scanned:
-
-```bash
-pulsar-relay --generate-totp                        # new secret + QR + manual code
-pulsar-relay --generate-totp --auth-totp <secret>   # re-show an existing enrollment
-```
-
-Pulsar sessions are **always** end-to-end encrypted (the relay forwards only sealed blobs
-and knows just which id talks to which), so `--require-e2e` states and enforces that
-policy rather than adding a cipher.
-
-### Docker
-
-```bash
-docker run -d --name pulsar-relay -p 21116:21116/udp ghcr.io/pulsardesk/relay
-# with per-session bandwidth limits:
-docker run -d -p 21116:21116/udp ghcr.io/pulsardesk/relay --session-rate 10mbit
-# or build locally:
-docker build -t pulsar-relay . && docker run -d -p 21116:21116/udp pulsar-relay
-```
-
-The image is a static musl build on a `scratch` base (a few MB); the port is
-**UDP**, so the `/udp` suffix matters.
-
-## Test
-
-```bash
+git clone https://github.com/PulsarDesk/relay.git
+cd relay
+cargo run --release
 cargo test
 ```
 
-Depends on the shared wire protocol
-[`PulsarDesk/pulsar-proto`](https://github.com/PulsarDesk/pulsar-proto)
-(git dependency).
+---
 
-## License
-
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+## 📄 License
+Pulsar is licensed under **GNU GPLv3 or later** (GPL-3.0-or-later). See the [LICENSE](LICENSE) file for details.
