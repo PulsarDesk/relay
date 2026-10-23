@@ -22,7 +22,8 @@
 everything on your side.
 
 The relay gives each device its ID, helps two devices find each other, and forwards traffic when they can't connect
-directly. Sessions are end-to-end encrypted, so the relay only ever sees scrambled data.
+directly. Sessions are end-to-end encrypted, so the relay only ever sees scrambled data. Like a self-hosted RustDesk server,
+but for Pulsar.
 
 ---
 
