@@ -88,9 +88,11 @@ pub const MAX_HELLO_LEN: usize = MAX_DATAGRAM;
 /// Below this effective receive buffer the relay drops bursts (see [`Relay::bind`]).
 const MIN_RECV_BUF: usize = 1 << 20;
 
-/// The usable size of a socket buffer `SO_RCVBUF` reported: Linux reports it doubled.
+/// The usable size of a socket buffer `SO_RCVBUF` reported: Linux (and Android) report it doubled.
 fn effective_buf(reported: usize) -> usize {
-	if cfg!(target_os = "linux") {
+	// Android too: the relay also runs embedded in the mobile app (local relay), on the same
+	// kernel accounting.
+	if cfg!(any(target_os = "linux", target_os = "android")) {
 		reported / 2
 	} else {
 		reported
@@ -120,6 +122,43 @@ struct Session {
 	last_seen: Instant,
 	/// When a member's address was last moved (see `rebind_member`), for log rate-limiting.
 	moved_at: Option<Instant>,
+	/// When each member's address last moved: [requester, target] (see `rebind_member`).
+	member_moved: [Option<Instant>; 2],
+}
+
+/// A session member's relay address moves at most this often (see [`rebind_member`]).
+const MIN_MOVE_GAP: Duration = Duration::from_secs(1);
+
+/// Move session member `id`'s relay address to `from` (it roamed: Wi-Fi ↔ LTE, a CGNAT port
+/// remap, a rebinding NAT after sleep). Only callers that checked the device's relay token run
+/// this, so an OFF-path sender cannot redirect a session. An ON-path observer (the same café
+/// Wi-Fi as one member) can capture a datagram with the token and replay it from its own
+/// address; it gets only ciphertext, but the real member's traffic goes astray until that
+/// member sends again. A member moves at most once per [`MIN_MOVE_GAP`], so a replayer cannot
+/// keep a session pinned to itself: the real member's next datagram after the gap takes it
+/// back. Returns the old address on a move; `None` when nothing moved (not a member, the same
+/// address, or a move within the gap).
+fn rebind_member(
+	sess: &mut Session,
+	id: DeviceId,
+	from: SocketAddr,
+	now: Instant,
+) -> Option<SocketAddr> {
+	let (addr, slot) = if id == sess.requester {
+		(&mut sess.requester_addr, 0)
+	} else if id == sess.target {
+		(&mut sess.target_addr, 1)
+	} else {
+		return None;
+	};
+	if *addr == from {
+		return None;
+	}
+	if sess.member_moved[slot].is_some_and(|t| now.duration_since(t) < MIN_MOVE_GAP) {
+		return None;
+	}
+	sess.member_moved[slot] = Some(now);
+	Some(std::mem::replace(addr, from))
 }
 
 /// The relay server. Build with [`Relay::bind`], then drive with [`Relay::run`].
@@ -187,7 +226,9 @@ impl Relay {
 			Ok(sz) if effective_buf(sz) < MIN_RECV_BUF => tracing::warn!(
 				%addr,
 				recv_buf = effective_buf(sz),
-				"relay UDP receive buffer is under 1 MiB: bursts will be dropped by the kernel — on the 				 relay HOST run `sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216` 				 (persist it in /etc/sysctl.d; a container cannot raise it), see docs/agents/operations.md"
+				"relay UDP receive buffer is under 1 MiB: bursts will be dropped by the kernel — on the \
+				 relay HOST run `sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216` \
+				 (persist it in /etc/sysctl.d; a container cannot raise it), see docs/agents/operations.md"
 			),
 			Ok(sz) => tracing::info!(%addr, recv_buf = effective_buf(sz), "relay UDP socket bound"),
 			Err(e) => {
@@ -436,12 +477,9 @@ impl Relay {
 					// gets its traffic again. Token-authenticated like the RelayData rebind;
 					// scanned only on a change, not on every heartbeat.
 					if moved {
+						let now = Self::now();
 						for s in self.sessions.values_mut() {
-							if s.requester == id {
-								s.requester_addr = from;
-							} else if s.target == id {
-								s.target_addr = from;
-							}
+							rebind_member(s, id, from, now);
 						}
 						tracing::info!(%id, new = %from, "relay: device moved — its sessions follow");
 					}
@@ -527,6 +565,7 @@ impl Relay {
 						target_addr: tdev.addr,
 						last_seen: Self::now(),
 						moved_at: None,
+						member_moved: [None, None],
 					},
 				);
 				tracing::info!(%target, target_addr = %tdev.addr, "relay: forwarding Incoming to target");
@@ -624,21 +663,14 @@ impl Relay {
 					// The member's address moves with it (Wi-Fi ↔ LTE, a CGNAT port remap, a
 					// rebinding NAT after sleep): the addresses pinned at Connect/Accept used to
 					// stay, so the moved side could still SEND but never received anything and
-					// the session died. Safe against spoofing: this runs only for a datagram
-					// that carried the device's secret relay token (`authed` above) and names a
-					// session the device is a member of — an off-path sender cannot redirect it.
-					let mine = if id == sess.requester {
-						Some(&mut sess.requester_addr)
-					} else if id == sess.target {
-						Some(&mut sess.target_addr)
-					} else {
-						None
-					};
-					let Some(mine) = mine else {
+					// the session died. Runs only for a datagram that carried the device's relay
+					// token (`authed` above) and names a session the device is a member of: an
+					// off-path sender cannot redirect it; an on-path replayer is rate-limited
+					// (see `rebind_member`).
+					if id != sess.requester && id != sess.target {
 						return Some((Self::err(ErrCode::Protocol, "not a session member"), from));
-					};
-					if *mine != from {
-						let old = std::mem::replace(mine, from);
+					}
+					if let Some(old) = rebind_member(sess, id, from, now) {
 						if sess
 							.moved_at
 							.is_none_or(|t| now.duration_since(t) >= MOVE_LOG_EVERY)
@@ -978,6 +1010,65 @@ impl Relay {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// A member's address follows it, but at most once per `MIN_MOVE_GAP`: a replayed
+	/// datagram cannot keep a session pinned to an on-path observer.
+	#[test]
+	fn member_moves_are_rate_limited() {
+		let a = |p: u16| -> SocketAddr { SocketAddr::from(([198, 51, 100, 1], p)) };
+		let t0 = Instant::now();
+		let mut sess = Session {
+			requester: DeviceId(111_111_111),
+			requester_addr: a(1),
+			target: DeviceId(222_222_222),
+			target_addr: a(2),
+			last_seen: t0,
+			moved_at: None,
+			member_moved: [None, None],
+		};
+		// Not a member / the same address: nothing moves.
+		assert_eq!(
+			rebind_member(&mut sess, DeviceId(333_333_333), a(9), t0),
+			None
+		);
+		assert_eq!(
+			rebind_member(&mut sess, DeviceId(111_111_111), a(1), t0),
+			None
+		);
+		// A real move.
+		assert_eq!(
+			rebind_member(&mut sess, DeviceId(111_111_111), a(3), t0),
+			Some(a(1))
+		);
+		assert_eq!(sess.requester_addr, a(3));
+		// A second move within the gap is refused; the other member is independent.
+		let soon = t0 + Duration::from_millis(300);
+		assert_eq!(
+			rebind_member(&mut sess, DeviceId(111_111_111), a(1), soon),
+			None
+		);
+		assert_eq!(sess.requester_addr, a(3));
+		assert_eq!(
+			rebind_member(&mut sess, DeviceId(222_222_222), a(4), soon),
+			Some(a(2))
+		);
+		// After the gap the member moves again.
+		let later = t0 + MIN_MOVE_GAP;
+		assert_eq!(
+			rebind_member(&mut sess, DeviceId(111_111_111), a(1), later),
+			Some(a(3))
+		);
+		assert_eq!(sess.requester_addr, a(1));
+	}
+
+	#[test]
+	fn android_and_linux_report_doubled_buffers() {
+		let doubled = cfg!(any(target_os = "linux", target_os = "android"));
+		assert_eq!(
+			effective_buf(2 << 20),
+			if doubled { 1 << 20 } else { 2 << 20 }
+		);
+	}
 
 	#[tokio::test]
 	async fn stable_id_survives_offline_gap_but_pubkey_ttl_bounds_the_map() {

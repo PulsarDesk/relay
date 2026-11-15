@@ -34,6 +34,10 @@ A relayed session's two addresses are set at Connect/Accept, then follow each me
 `RelayData` or `Heartbeat` carrying the member's token from a new source address (Wi-Fi ↔ LTE,
 a CGNAT port remap, a NAT that rebound after sleep) moves that member's side of its sessions
 there. The token is the device's relay secret, so an off-path sender cannot redirect a session.
+It travels in clear, though: an on-path observer (the same Wi-Fi as a member) can replay a
+captured datagram from its own address. It only gets ciphertext, and a member moves at most
+once per second (`MIN_MOVE_GAP`), so the real member's next datagram after that takes the
+session back.
 
 ### Bandwidth limits (operator, optional — default unlimited)
 
