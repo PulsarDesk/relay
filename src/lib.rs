@@ -85,6 +85,21 @@ pub const MAX_RELAY_PAYLOAD: usize = 64 * 1024; // 64 KB — covers JSON-expande
 /// meaningful amplification). Oversized Connects are dropped (UDP — the sender adapts).
 pub const MAX_HELLO_LEN: usize = MAX_DATAGRAM;
 
+/// Below this effective receive buffer the relay drops bursts (see [`Relay::bind`]).
+const MIN_RECV_BUF: usize = 1 << 20;
+
+/// The usable size of a socket buffer `SO_RCVBUF` reported: Linux reports it doubled.
+fn effective_buf(reported: usize) -> usize {
+	if cfg!(target_os = "linux") {
+		reported / 2
+	} else {
+		reported
+	}
+}
+
+/// Don't log the same session's address moves more often than this.
+const MOVE_LOG_EVERY: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Clone)]
 struct Device {
 	addr: SocketAddr,
@@ -103,6 +118,8 @@ struct Session {
 	target: DeviceId,
 	target_addr: SocketAddr,
 	last_seen: Instant,
+	/// When a member's address was last moved (see `rebind_member`), for log rate-limiting.
+	moved_at: Option<Instant>,
 }
 
 /// The relay server. Build with [`Relay::bind`], then drive with [`Relay::run`].
@@ -164,7 +181,15 @@ impl Relay {
 		sock2.set_nonblocking(true)?; // tokio's UdpSocket::from_std requires non-blocking
 		sock2.bind(&addr.into())?;
 		match sock2.recv_buffer_size() {
-			Ok(sz) => tracing::info!(%addr, recv_buf = sz, "relay UDP socket bound"),
+			// Linux reports twice the usable size; a stock kernel clamps the 8 MiB request to
+			// net.core.rmem_max = 208 KiB SILENTLY, and every burst over it is dropped (the
+			// sessions see it as network loss). Say so loudly, with the fix.
+			Ok(sz) if effective_buf(sz) < MIN_RECV_BUF => tracing::warn!(
+				%addr,
+				recv_buf = effective_buf(sz),
+				"relay UDP receive buffer is under 1 MiB: bursts will be dropped by the kernel — on the 				 relay HOST run `sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216` 				 (persist it in /etc/sysctl.d; a container cannot raise it), see docs/agents/operations.md"
+			),
+			Ok(sz) => tracing::info!(%addr, recv_buf = effective_buf(sz), "relay UDP socket bound"),
 			Err(e) => {
 				tracing::warn!(%addr, "relay UDP socket bound (recv_buffer_size query failed: {e})")
 			}
@@ -400,9 +425,25 @@ impl Relay {
 
 			ClientMsg::Heartbeat { id, token } => {
 				if self.authed(id, token) {
+					let mut moved = false;
 					if let Some(dev) = self.devices.get_mut(&id) {
+						moved = dev.addr != from;
 						dev.addr = from;
 						dev.last_seen = Self::now();
+					}
+					// The device's address changed (roaming / NAT remap): move its live relay
+					// sessions too, so a side that only receives (no RelayData of its own yet)
+					// gets its traffic again. Token-authenticated like the RelayData rebind;
+					// scanned only on a change, not on every heartbeat.
+					if moved {
+						for s in self.sessions.values_mut() {
+							if s.requester == id {
+								s.requester_addr = from;
+							} else if s.target == id {
+								s.target_addr = from;
+							}
+						}
+						tracing::info!(%id, new = %from, "relay: device moved — its sessions follow");
 					}
 					tracing::debug!(%id, "heartbeat");
 					Some((encode(&RelayMsg::HeartbeatAck), from))
@@ -485,6 +526,7 @@ impl Relay {
 						target,
 						target_addr: tdev.addr,
 						last_seen: Self::now(),
+						moved_at: None,
 					},
 				);
 				tracing::info!(%target, target_addr = %tdev.addr, "relay: forwarding Incoming to target");
@@ -577,13 +619,38 @@ impl Relay {
 					let Some(sess) = self.sessions.get_mut(&session) else {
 						return Some((Self::err(ErrCode::Protocol, "no such session"), from));
 					};
-					sess.last_seen = Self::now();
+					let now = Self::now();
+					sess.last_seen = now;
+					// The member's address moves with it (Wi-Fi ↔ LTE, a CGNAT port remap, a
+					// rebinding NAT after sleep): the addresses pinned at Connect/Accept used to
+					// stay, so the moved side could still SEND but never received anything and
+					// the session died. Safe against spoofing: this runs only for a datagram
+					// that carried the device's secret relay token (`authed` above) and names a
+					// session the device is a member of — an off-path sender cannot redirect it.
+					let mine = if id == sess.requester {
+						Some(&mut sess.requester_addr)
+					} else if id == sess.target {
+						Some(&mut sess.target_addr)
+					} else {
+						None
+					};
+					let Some(mine) = mine else {
+						return Some((Self::err(ErrCode::Protocol, "not a session member"), from));
+					};
+					if *mine != from {
+						let old = std::mem::replace(mine, from);
+						if sess
+							.moved_at
+							.is_none_or(|t| now.duration_since(t) >= MOVE_LOG_EVERY)
+						{
+							tracing::info!(%id, session, %old, new = %from, "relay: session member moved");
+						}
+						sess.moved_at = Some(now);
+					}
 					if id == sess.requester {
 						sess.target_addr
-					} else if id == sess.target {
-						sess.requester_addr
 					} else {
-						return Some((Self::err(ErrCode::Protocol, "not a session member"), from));
+						sess.requester_addr
 					}
 				};
 				// Operator bandwidth limits: silently drop (don't forward) when the
