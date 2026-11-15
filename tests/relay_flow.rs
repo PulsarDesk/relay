@@ -252,3 +252,167 @@ async fn full_rendezvous_and_relay_forwarding() {
 		other => panic!("A expected RelayData, got {other:?}"),
 	}
 }
+
+/// Rendezvous A → B on `session`, draining Incoming / PeerFound.
+async fn rendezvous(
+	relay: SocketAddr,
+	a: &UdpSocket,
+	(id_a, token_a): (DeviceId, Token),
+	b: &UdpSocket,
+	(id_b, token_b): (DeviceId, Token),
+	session: u64,
+) {
+	send(
+		a,
+		relay,
+		&ClientMsg::Connect {
+			id: id_a,
+			token: token_a,
+			target: id_b,
+			session,
+			hello: vec![1],
+		},
+	)
+	.await;
+	assert!(matches!(recv(b).await, RelayMsg::Incoming { .. }));
+	send(
+		b,
+		relay,
+		&ClientMsg::Accept {
+			id: id_b,
+			token: token_b,
+			session,
+			answer: vec![2],
+		},
+	)
+	.await;
+	assert!(matches!(recv(a).await, RelayMsg::PeerFound { .. }));
+}
+
+/// A session member that moved (Wi-Fi ↔ LTE, a CGNAT port remap) keeps receiving: its next
+/// token-authenticated RelayData from the new address moves the session's return path there.
+#[tokio::test]
+async fn relay_session_follows_a_member_that_moved() {
+	let relay = start_relay().await;
+	let a = client().await;
+	let b = client().await;
+	let (id_a, token_a) = register(&a, relay, "A").await;
+	let (id_b, token_b) = register(&b, relay, "B").await;
+	let session = 0x5151;
+	rendezvous(relay, &a, (id_a, token_a), &b, (id_b, token_b), session).await;
+
+	// B "moves": same identity + token, a new socket (a new source address).
+	let b2 = client().await;
+	send(
+		&b2,
+		relay,
+		&ClientMsg::RelayData {
+			id: id_b,
+			token: token_b,
+			session,
+			payload: vec![1],
+		},
+	)
+	.await;
+	assert!(matches!(recv(&a).await, RelayMsg::RelayData { .. }));
+	// A's traffic now reaches B at the NEW address.
+	send(
+		&a,
+		relay,
+		&ClientMsg::RelayData {
+			id: id_a,
+			token: token_a,
+			session,
+			payload: vec![4, 2],
+		},
+	)
+	.await;
+	match recv(&b2).await {
+		RelayMsg::RelayData { payload, .. } => assert_eq!(payload, vec![4, 2]),
+		other => panic!("moved B expected RelayData, got {other:?}"),
+	}
+}
+
+/// A heartbeat from a new address moves the device's sessions too (a side that only
+/// receives sends no RelayData of its own).
+#[tokio::test]
+async fn heartbeat_from_a_new_address_moves_the_sessions() {
+	let relay = start_relay().await;
+	let a = client().await;
+	let b = client().await;
+	let (id_a, token_a) = register(&a, relay, "A").await;
+	let (id_b, token_b) = register(&b, relay, "B").await;
+	let session = 0x5252;
+	rendezvous(relay, &a, (id_a, token_a), &b, (id_b, token_b), session).await;
+
+	let b2 = client().await;
+	send(
+		&b2,
+		relay,
+		&ClientMsg::Heartbeat {
+			id: id_b,
+			token: token_b,
+		},
+	)
+	.await;
+	assert!(matches!(recv(&b2).await, RelayMsg::HeartbeatAck));
+	send(
+		&a,
+		relay,
+		&ClientMsg::RelayData {
+			id: id_a,
+			token: token_a,
+			session,
+			payload: vec![8],
+		},
+	)
+	.await;
+	assert!(matches!(recv(&b2).await, RelayMsg::RelayData { .. }));
+}
+
+/// Without the member's token a datagram from elsewhere cannot redirect the session.
+#[tokio::test]
+async fn a_wrong_token_does_not_move_the_session() {
+	let relay = start_relay().await;
+	let a = client().await;
+	let b = client().await;
+	let (id_a, token_a) = register(&a, relay, "A").await;
+	let (id_b, token_b) = register(&b, relay, "B").await;
+	let session = 0x5353;
+	rendezvous(relay, &a, (id_a, token_a), &b, (id_b, token_b), session).await;
+
+	let attacker = client().await;
+	send(
+		&attacker,
+		relay,
+		&ClientMsg::RelayData {
+			id: id_b,
+			token: Token([0xAA; 16]),
+			session,
+			payload: vec![0],
+		},
+	)
+	.await;
+	assert!(matches!(
+		recv(&attacker).await,
+		RelayMsg::Error {
+			code: ErrCode::BadToken,
+			..
+		}
+	));
+	send(
+		&a,
+		relay,
+		&ClientMsg::RelayData {
+			id: id_a,
+			token: token_a,
+			session,
+			payload: vec![3],
+		},
+	)
+	.await;
+	assert!(
+		matches!(recv(&b).await, RelayMsg::RelayData { .. }),
+		"still delivered to the real B"
+	);
+}

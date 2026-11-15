@@ -10,6 +10,35 @@ cargo run -p pulsar-relay -- --port 5000
 PULSAR_RELAY_BIND=127.0.0.1:21116 cargo run -p pulsar-relay
 ```
 
+### Host UDP buffers (Linux — do this on every relay host)
+
+The relay asks for an 8 MiB receive / 4 MiB send buffer. A stock kernel clamps that silently
+to `net.core.rmem_max` = 208 KiB, and the relay then drops every burst over it (the sessions
+see it as network loss: retransmits, bitrate cuts). The relay logs a WARN at start when it got
+under 1 MiB. Raise the caps on the HOST (a container cannot — `net.core.*` is not namespaced,
+so `docker run --sysctl` refuses it):
+
+```bash
+printf 'net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+' | sudo tee /etc/sysctl.d/60-pulsar-relay.conf
+sudo sysctl --system
+```
+
+Then restart the relay (the buffer is sized at bind). `grep RcvbufErrors /proc/net/snmp` shows
+the kernel's drop counter.
+
+### Sessions follow a moved member
+
+A relayed session's two addresses are set at Connect/Accept, then follow each member: a
+`RelayData` or `Heartbeat` carrying the member's token from a new source address (Wi-Fi ↔ LTE,
+a CGNAT port remap, a NAT that rebound after sleep) moves that member's side of its sessions
+there. The token is the device's relay secret, so an off-path sender cannot redirect a session.
+It travels in clear, though: an on-path observer (the same Wi-Fi as a member) can replay a
+captured datagram from its own address. It only gets ciphertext, and a member moves at most
+once per second (`MIN_MOVE_GAP`), so the real member's next datagram after that takes the
+session back.
+
 ### Bandwidth limits (operator, optional — default unlimited)
 
 Cap the **relayed** traffic (the `RelayData` the server forwards) by **device**, by

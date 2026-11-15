@@ -61,6 +61,19 @@ docker build -t pulsar-relay . && docker run -d -p 21116:21116/udp pulsar-relay
 The image is a static musl build on a `scratch` base (a few MB); the port is
 **UDP**, so the `/udp` suffix matters.
 
+### Linux host: UDP buffers
+
+A stock Linux kernel caps a socket's buffers at 208 KiB, and a relay that busy drops
+datagrams in every burst (the relay logs a WARN at start when it got under 1 MiB). Raise the
+caps once on the **host** (a container cannot change `net.core.*`), then restart the relay:
+
+```bash
+printf 'net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+' | sudo tee /etc/sysctl.d/60-pulsar-relay.conf
+sudo sysctl --system
+```
+
 ## Test
 
 ```bash
