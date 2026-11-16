@@ -618,10 +618,11 @@ impl Relay {
 				if !self.allow_signal(id, from.ip(), answer.len()) {
 					return None;
 				}
-				let _ = requester_id; // used for symmetry with Connect; may wire to metrics later
-						  // Tell the requester the target accepted, with the target's address — and
-						  // advertise the per-session forwarding cap so a relayed client starts its
-						  // encoder within the pipe (0 = uncapped).
+				// Used for symmetry with Connect; may wire to metrics later.
+				let _ = requester_id;
+				// Tell the requester the target accepted, with the target's address — and
+				// advertise the per-session forwarding cap so a relayed client starts its
+				// encoder within the pipe (0 = uncapped).
 				Some((
 					encode(&RelayMsg::PeerFound {
 						target: id,

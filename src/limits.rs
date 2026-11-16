@@ -222,8 +222,9 @@ mod tests {
 		// 1000 B/s rate, no volume cap. The bucket starts full (~1s burst) so the first
 		// 1000 bytes pass, then further bytes in the same instant are dropped.
 		assert!(m.charge(t0, 1000, Some(1000), None));
-		assert!(!m.charge(t0, 1, Some(1000), None)); // bucket empty → dropped
-											   // After ~1s the bucket refills enough for another 1000 bytes.
+		// Bucket empty → dropped.
+		assert!(!m.charge(t0, 1, Some(1000), None));
+		// After ~1s the bucket refills enough for another 1000 bytes.
 		let t1 = t0 + Duration::from_secs(1);
 		assert!(m.charge(t1, 1000, Some(1000), None));
 	}
