@@ -218,7 +218,7 @@ pub struct TotpEnrollment {
 	/// The shared secret, base32 (what `--auth-totp` takes).
 	pub secret: String,
 	/// The same secret in 4-character groups — what a human types when a QR can't be
-	/// scanned ("özel kod").
+	/// scanned ("setup key").
 	pub secret_grouped: String,
 	/// `otpauth://totp/...` URI that authenticator apps consume.
 	pub uri: String,
