@@ -1,87 +1,120 @@
 <p align="center">
-  <img width="120" height="120" src="https://avatars.githubusercontent.com/u/290144039?s=240" alt="Pulsar logo">
+  <a href="https://pulsardesk.com"><img src=".github/assets/hero.png" alt="Pulsar Relay: your server, your rules" width="100%"></a>
 </p>
 
-<h1 align="center">Pulsar Relay</h1>
+<h3 align="center">Run your own Pulsar server in one command.</h3>
 
 <p align="center">
-  Run your own Pulsar server: your own device IDs and your own fallback when a direct connection isn't possible. 🛰️
+  Pulsar works out of the box with the public server. Run this one when you want <b>everything on your own side</b>:<br>
+  your own device IDs, your own connection helper, your own fallback when a direct link isn't possible.
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/maintenance/yes/2026?style=for-the-badge" alt="Maintained">
-  <a href="https://github.com/PulsarDesk/relay/releases"><img src="https://img.shields.io/github/v/release/PulsarDesk/relay?include_prereleases&style=for-the-badge" alt="Release"></a>
-  <a href="https://github.com/PulsarDesk/relay/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/PulsarDesk/relay/ci.yml?branch=main&style=for-the-badge&label=CI" alt="CI"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/PulsarDesk/relay?style=for-the-badge" alt="License"></a>
+  <a href="#-start-in-one-minute"><img src="https://img.shields.io/badge/Docker-Run_it-5B57E0?style=for-the-badge&logo=docker&logoColor=white" alt="Run with Docker"></a>
+  <a href="https://github.com/PulsarDesk/relay/releases/latest"><img src="https://img.shields.io/badge/Binary-Linux_·_Windows_·_macOS-13B3D4?style=for-the-badge" alt="Download a binary"></a>
 </p>
 
----
+<p align="center">
+  <a href="https://github.com/PulsarDesk/relay/releases"><img src="https://img.shields.io/github/v/release/PulsarDesk/relay?include_prereleases&style=flat-square&color=5B57E0&label=version" alt="Version"></a>
+  <a href="https://github.com/PulsarDesk/relay/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/PulsarDesk/relay/ci.yml?branch=main&style=flat-square&label=CI" alt="CI"></a>
+  <a href="https://github.com/PulsarDesk/relay/stargazers"><img src="https://img.shields.io/github/stars/PulsarDesk/relay?style=flat-square&color=13B3D4" alt="Stars"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPLv3-5B57E0?style=flat-square" alt="License: GPLv3"></a>
+</p>
 
-## 🚀 Project Status
-**Current Status:** Alpha (0.x). Pulsar works out of the box with the public relay; run your own when you want
-everything on your side.
+## 🛰️ What does it do?
 
-The relay gives each device its ID, helps two devices find each other, and forwards traffic when they can't connect
-directly. Sessions are end-to-end encrypted, so the relay only ever sees scrambled data. Like a self-hosted RustDesk server,
-but for Pulsar.
+<table>
+<tr>
+<td width="33%" valign="top">
 
----
+### 🪪 Hands out IDs
+Every device that connects gets its 9-digit Pulsar ID from your server.
 
-## 📦 Other Pulsar Repositories
-- [**pulsar-desktop**](https://github.com/PulsarDesk/pulsar-desktop) - Pulsar for Windows, macOS and Linux
-- [**pulsar-mobile**](https://github.com/PulsarDesk/pulsar-mobile) - Pulsar for Android
-- [**pulsar-core**](https://github.com/PulsarDesk/pulsar-core) - The shared engine behind both apps
+</td>
+<td width="33%" valign="top">
 
----
+### 🤝 Introduces devices
+It helps two devices find each other, so they can talk **directly**, without anything in the middle.
 
-## ⚡ Running a relay
-- **Docker (easiest):**
+</td>
+<td width="33%" valign="top">
+
+### 🔁 Steps in when needed
+When a direct link isn't possible, it passes the traffic along. It can't read it: sessions are end-to-end
+encrypted.
+
+</td>
+</tr>
+</table>
+
+Think of it as a self-hosted RustDesk server, but for Pulsar. It's tiny: a single program, very little CPU and
+memory, and one UDP port.
+
+## ⚡ Start in one minute
+
+**1. Run it** with Docker (easiest):
 
 ```bash
 docker run -d --name pulsar-relay --restart unless-stopped -p 21116:21116/udp ghcr.io/pulsardesk/relay
 ```
 
-- **Binary:** download `pulsar-relay` for your system from the [latest release](https://github.com/PulsarDesk/relay/releases/latest)
-  (Linux x64 / arm64, Windows x64, macOS) and run it.
-- **On your phone:** the [Android app](https://github.com/PulsarDesk/pulsar-mobile) can run a relay for your Wi-Fi
-  (Settings).
+Or download `pulsar-relay` for your system from the [latest release](https://github.com/PulsarDesk/relay/releases/latest)
+(Linux x64 / arm64, Windows x64, macOS) and start it. No server at all? The
+[Android app](https://github.com/PulsarDesk/pulsar-mobile) can run a relay for your Wi-Fi (Settings).
 
-Open **UDP port 21116** on your firewall. Then in Pulsar on every device: Settings -> Network -> relay
-`your-server:21116`.
+**2. Open UDP port 21116** on your firewall.
 
-Optional password, 2FA and bandwidth limits: `pulsar-relay --help` and [docs/self-hosting.md](docs/self-hosting.md).
+**3. Point Pulsar at it:** on every device, Settings → Network → relay `your-server:21116`.
 
-### Where it has been tested
+Done. Your devices now get their IDs from your server.
+
+## 🔐 Lock it down (optional)
+
+A relay is open by default. Add a password, a two-factor (TOTP) code, or both, and require end-to-end encryption:
+
+```bash
+pulsar-relay --auth-password s3cret                 # password
+pulsar-relay --auth-totp JBSWY3DPEHPK3PXP           # 2FA code (base32 secret)
+pulsar-relay --require-e2e                          # only accept encrypted sessions
+```
+
+Enrolling 2FA prints a QR code to scan with your authenticator app. Bandwidth limits and every other option:
+`pulsar-relay --help` and [docs/self-hosting.md](docs/self-hosting.md).
+
+## 🧪 Where it has been tested
+
 | Where | Status |
 |---|---|
 | Linux x64, Docker | ✅ runs the public relay |
 | Android (inside the app) | ✅ |
 | Linux arm64, Windows, macOS binaries | ❔ built on every release, not tested |
 
----
+Pulsar is in **alpha** (0.x).
 
 ## 🐞 Reporting a bug
+
 [Open an issue](https://github.com/PulsarDesk/relay/issues/new/choose) and include:
 
 - Relay version (`pulsar-relay --version`) and how you run it (Docker, binary, phone)
 - Your options, **without passwords or 2FA secrets**
 - What the app shows when it fails, and the relay's output around that time
 
----
+## 🌌 The Pulsar family
 
-## 🛠️ Requirements
-**To run:** any Linux, Windows or macOS machine reachable on one UDP port. It uses very little CPU and memory; the
-bandwidth it needs depends on how many sessions can't connect directly.
+| | Project | |
+|---|---|---|
+| 🖥️ | [**Pulsar Desktop**](https://github.com/PulsarDesk/pulsar-desktop) | Pulsar for Windows, macOS and Linux |
+| 📱 | [**Pulsar Mobile**](https://github.com/PulsarDesk/pulsar-mobile) | Pulsar for Android phones, tablets and TVs |
+| 🧩 | [**pulsar-core**](https://github.com/PulsarDesk/pulsar-core) | The shared engine behind both apps |
+| 🌐 | [**pulsardesk.com**](https://pulsardesk.com) | The website |
 
-**For contributors / development:** Rust stable.
+## 🛠️ For developers
 
----
+<details>
+<summary>Build from source</summary>
 
-## 🤝 Contributing
-Everyone can open [issues](https://github.com/PulsarDesk/relay/issues) and pull requests. Irrelevant or abusive
-issues may be closed or removed. Commits follow [Conventional Commits](https://www.conventionalcommits.org).
+**Needs:** Rust stable.
 
-### Development Guide
 ```bash
 git clone https://github.com/PulsarDesk/relay.git
 cd relay
@@ -89,7 +122,16 @@ cargo run --release
 cargo test
 ```
 
----
+</details>
+
+Everyone is welcome to open [issues](https://github.com/PulsarDesk/relay/issues) and pull requests. Irrelevant or
+abusive issues may be closed or removed. Commits follow [Conventional Commits](https://www.conventionalcommits.org).
 
 ## 📄 License
-Pulsar is licensed under **GNU GPLv3 or later** (GPL-3.0-or-later). See the [LICENSE](LICENSE) file for details.
+
+Pulsar is free software under the **GNU GPLv3 or later** (GPL-3.0-or-later). See [LICENSE](LICENSE).
+
+<p align="center">
+  <br>
+  <b>Like Pulsar? A ⭐ helps other people find it.</b>
+</p>
